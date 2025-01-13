@@ -857,6 +857,7 @@ class CacheConfig:
             prefix caching enabled.
         enable_prefix_caching: Whether to enable prefix caching.
         cpu_offload_gb: Size of the CPU offload buffer in GiB.
+        enable_layer_kv: Enable layer-wise KV cache management. 
     """
 
     def compute_hash(self) -> str:
@@ -888,6 +889,7 @@ class CacheConfig:
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
+        enable_layer_wise_cache: bool = False,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -898,6 +900,7 @@ class CacheConfig:
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
         self.cpu_offload_gb = cpu_offload_gb
+        self.enable_layer_wise_cache = enable_layer_wise_cache
 
         self._verify_args()
         self._verify_cache_dtype()
@@ -1310,6 +1313,21 @@ class SchedulerConfig:
     policy: str = "fcfs"
 
     chunked_prefill_enabled: bool = field(init=False)
+
+    # If True, use SLO scheduler
+    enable_slo_scheduler: bool = False
+
+    # TTFT SLO s
+    slo_ttft: float = 3.0
+
+    # TPOT SLO s
+    slo_tpot: float = 0.1
+
+    # predictor path
+    predictor_path: Optional[str] = None
+
+    # alpha for estimate the prefill time for each request
+    alpha: Optional[float] = None
 
     def compute_hash(self) -> str:
         """

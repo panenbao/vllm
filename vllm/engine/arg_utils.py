@@ -195,6 +195,18 @@ class EngineArgs:
     compilation_config: Optional[CompilationConfig] = None
     worker_cls: str = "auto"
 
+    # LayerKV settings    
+    enable_slo_scheduler: bool = False
+    slo_ttft: Optional[float] = None
+    slo_tpot: Optional[float] = None
+    predictor_path: Optional[str] = None
+    enable_layer_wise_cache: bool = False
+    # empirical correction factors
+    # alpha for estimate the prefill time for each request
+    alpha: Optional[float] = None
+    # beta for estimate the offloading time from GPU to CPU
+    beta: Optional[float] = None
+    
     kv_transfer_config: Optional[KVTransferConfig] = None
 
     def __post_init__(self):
@@ -939,7 +951,52 @@ class EngineArgs:
             type=str,
             default="auto",
             help='The worker class to use for distributed execution.')
-
+        
+        # LayerKV arguments
+        # Scheduler
+        parser.add_argument(
+            '--enable-slo-scheduler',
+            action='store_true',
+            default=False,
+            help='Enable SLO scheduler')
+        
+        parser.add_argument(
+            '--slo-ttft',
+            type=float,
+            default=3000.0,
+            help='TTFT SLO for SLO scheduler, ms.')
+        
+        parser.add_argument(
+            '--slo-tpot',
+            type=float,
+            default=200.0,
+            help='TPOT SLO for SLO scheduler, ms.')
+        
+        parser.add_argument(
+            '--alpha',
+            type=float,
+            default=4.244634539569536,
+            help='alpha for estimate the prefill time for each request')
+        
+        parser.add_argument(
+            '--beta',
+            type=float,
+            default=0.0,
+            help='beta for estimate the offloading time from GPU to CPU')
+        
+        parser.add_argument(
+            '--predictor-path',
+            type=str,
+            default="/home/panenbao/models/predictions_llama-2-7b-hf_multi_cls_lowwer_than_512.pth",
+            help='Path od predictor for slo-aware scheduler.')
+        
+        # KV cache
+        parser.add_argument(
+            '--enable-layer-wise-cache',
+            action='store_true',
+            default=False,
+            help='Enable layer-wise cache management. ')
+        
         return parser
 
     @classmethod
@@ -1043,6 +1100,7 @@ class EngineArgs:
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
+            enable_layer_wise_cache=self.enable_layer_wise_cache,
         )
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
@@ -1173,7 +1231,12 @@ class EngineArgs:
             multi_step_stream_outputs=self.multi_step_stream_outputs,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
-            policy=self.scheduling_policy)
+            policy=self.scheduling_policy,
+            enable_slo_scheduler=self.enable_slo_scheduler,
+            slo_ttft=self.slo_ttft,
+            slo_tpot=self.slo_tpot,
+            predictor_path=self.predictor_path,
+            alpha=self.alpha,)
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,
