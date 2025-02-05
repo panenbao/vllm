@@ -398,6 +398,7 @@ class Sequence:
         eos_token_id: The end-of-sequence (EOS) token id recognized by this LLM.
         lora_request: LoRA request.
         prompt_adapter_request: Prompt Adapter request.
+        prediction_token_len: Prediction num of generate tokens.
     """
 
     def __init__(
@@ -408,6 +409,8 @@ class Sequence:
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        predict_token_len: Optional[int] = None,
+        estimate_prefill_time: Optional[float] = None,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = SingletonInputsAdapter(inputs)
@@ -432,6 +435,12 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+
+        # Prediction num of generate tokens
+        self.predict_token_len = predict_token_len
+
+        # Prefill time (estimate)
+        self.estimate_prefill_time = estimate_prefill_time
 
     @property
     def n_blocks(self) -> int:
