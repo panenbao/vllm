@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest  # noqa
 from torch import Use  # noqa
 
-from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig, LayerKVConfig
 from vllm.core.interfaces import AllocStatus
 from vllm.core.scheduler import Scheduler, SchedulingBudget
 from vllm.lora.request import LoRARequest
@@ -16,6 +16,8 @@ from .utils import (append_new_token, append_new_token_seq,
                     append_new_token_seq_group, create_dummy_prompt,
                     get_sequence_groups, schedule_and_update_computed_tokens)
 
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+import torch
 
 def test_scheduler_add_seq_group():
     block_size = 4
@@ -24,11 +26,18 @@ def test_scheduler_add_seq_group():
         max_num_batched_tokens=100,
         max_num_seqs=64,
         max_model_len=1,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, cache_dtype="auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
 
     # Add seq group to scheduler.
     num_seq_group = 4
@@ -47,11 +56,19 @@ def test_scheduler_abort_seq_group():
         max_num_batched_tokens=100,
         max_num_seqs=64,
         max_model_len=1,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
 
     # Add multiple seq groups to scheduler.
     num_seq_group = 4
@@ -76,11 +93,19 @@ def test_scheduler_schedule_simple():
         max_num_batched_tokens=64,
         max_num_seqs=num_seq_group,
         max_model_len=max_model_len,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
     running: List[SequenceGroup] = []
 
     # Add seq groups to scheduler.
@@ -121,11 +146,19 @@ def test_scheduler_prefill_prioritized():
         max_num_batched_tokens=max_batched_num_tokens,
         max_num_seqs=2,
         max_model_len=max_model_len,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 16
     cache_config.num_gpu_blocks = 16
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
 
     # Add seq groups to scheduler.
     _, seq_group_a = create_dummy_prompt("1", 1, block_size=block_size)
@@ -153,11 +186,19 @@ def test_scheduler_schedule_preempt_abort():
         max_num_batched_tokens=64,
         max_num_seqs=2,
         max_model_len=max_model_len,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 2
     cache_config.num_gpu_blocks = 2
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=32, num_heads=8, head_dim=64, dtype=torch.float32)
+
 
     # Add seq groups to scheduler.
     seq_a, seq_group_a = create_dummy_prompt("1",
@@ -213,11 +254,20 @@ def test_scheduler_max_seqs():
         max_num_batched_tokens=64,
         max_num_seqs=max_seq_group,
         max_model_len=max_model_len,
+        enable_slo_scheduler=True,
+        
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
 
     all_seq_groups: List[SequenceGroup] = []
     # Add seq groups to scheduler.
@@ -259,11 +309,19 @@ def test_scheduler_delay_factor():
         max_num_seqs=64,
         max_model_len=16,
         delay_factor=0.5,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, None, layer_kv_config, parameters=6e10, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
 
     # schedule first prompt
     seq_group_meta, seq_group = create_dummy_prompt("0",
@@ -315,6 +373,7 @@ def initialize_scheduler(
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         enable_chunked_prefill=enable_chunked_prefill,
+        enable_slo_scheduler=True,
     )
     cache_config = CacheConfig(
         block_size,
@@ -325,7 +384,14 @@ def initialize_scheduler(
     )
     cache_config.num_cpu_blocks = num_cpu_blocks
     cache_config.num_gpu_blocks = num_gpu_blocks
-    scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+    layer_kv_config = LayerKVConfig(True)
+    # if cache_config.cache_dtype == "auto":
+    #     dtype = dtype
+    # else:
+    #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    scheduler = Scheduler(scheduler_config, cache_config, lora_config, layer_kv_config, 1 ,parameters=100, num_layers=8, num_heads=8, head_dim=64, dtype=torch.float32)
+
     return scheduler
 
 

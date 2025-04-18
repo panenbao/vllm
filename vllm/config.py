@@ -1327,7 +1327,8 @@ class SchedulerConfig:
     predictor_path: Optional[str] = None
 
     # alpha for estimate the prefill time for each request
-    alpha: Optional[float] = None
+    estimate_offload_alpha_factor: Optional[float] = None
+    estimate_offload_beta_factor: Optional[float] = None
 
     def compute_hash(self) -> str:
         """
@@ -1419,6 +1420,63 @@ class SchedulerConfig:
     def is_multi_step(self) -> bool:
         return self.num_scheduler_steps > 1
 
+@dataclass
+class LayerKVConfig:
+    """Configuration for layer-wise KV cache management.
+
+    This config controls how KV cache is managed layer by layer, enabling TPOT SLO
+    optimization through flexible layer placement between GPU and CPU memory.
+
+    Args:
+        enable_layer_wise_cache (bool): Whether to enable layer-wise KV cache management.
+            Defaults to False.
+        pcie_bandwidth (float): PCIe bandwidth in GB/s, used to estimate offload time.
+            Defaults to 64.0 GB/s.
+        device_flops (float): Device FLOPS, used to estimate prefill time.
+            Defaults to 1.95e13 FLOPS.
+        prefill_alpha (float): Empirical correction factor for prefill time estimation.
+            Defaults to 1089.321656324961
+        offload_beta (float): Empirical correction factor for offload time estimation.
+            Defaults to 1.0.
+
+    """
+
+    def __init__(
+        self,
+        enable_layer_wise_cache: bool = False,
+        pcie_bandwidth: float = 64.0,
+        device_flops: float = 1.95e13,
+        prefill_alpha: float = 1089.321656324961,
+        offload_beta: float = 1.0,
+    ) -> None:
+        self.enable_layer_wise_cache = enable_layer_wise_cache
+        self.pcie_bandwidth = pcie_bandwidth  # GB/s
+        self.device_flops = device_flops  # FLOPS
+        self.prefill_alpha = prefill_alpha
+        self.offload_beta = offload_beta
+
+        self._verify_args()
+
+    def _verify_args(self) -> None:
+        """Verify that config arguments are valid."""
+        if not self.enable_layer_wise_cache:
+            return
+            
+        if self.pcie_bandwidth <= 0:
+            raise ValueError(
+                f"PCIe bandwidth must be positive, got {self.pcie_bandwidth}")
+
+        if self.device_flops <= 0:
+            raise ValueError(
+                f"Device FLOPS must be positive, got {self.device_flops}")
+
+        if self.prefill_alpha <= 0:
+            raise ValueError(
+                f"Alpha must be positive, got {self.prefill_alpha}")
+
+        if self.offload_beta <= 0:
+            raise ValueError(
+                f"Beta must be positive, got {self.offload_beta}")
 
 class DeviceConfig:
     device: Optional[torch.device]
@@ -2879,6 +2937,7 @@ class VllmConfig:
                                               init=True)
     device_config: DeviceConfig = field(default=None,
                                         init=True)  # type: ignore
+    layer_kv_config: LayerKVConfig = field(default=None, init=True)  # type: ignore
     load_config: LoadConfig = field(default=None, init=True)  # type: ignore
     lora_config: Optional[LoRAConfig] = None
     speculative_config: Optional[SpeculativeConfig] = None
@@ -3036,6 +3095,9 @@ class VllmConfig:
                 "Turing devices tensor cores do not support float32 matmul. "
                 "To workaround this limitation, vLLM will set 'ieee' input "
                 "precision for chunked prefill triton kernels.")
+
+        if self.layer_kv_config is None:
+            self.layer_kv_config = LayerKVConfig()
 
         if self.compilation_config is None:
             self.compilation_config = CompilationConfig()

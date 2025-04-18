@@ -61,6 +61,8 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter, Device, deprecate_kwargs, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.prediction_utils.predictor import OutputTokenLengthPredictor
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -218,6 +220,7 @@ class LLMEngine:
         return outputs_
 
     tokenizer: Optional[BaseTokenizerGroup]
+    predictor: Optional[OutputTokenLengthPredictor]
 
     def __init__(
         self,
@@ -240,6 +243,7 @@ class LLMEngine:
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config  # noqa
         self.load_config = vllm_config.load_config
+        self.layer_kv_config = vllm_config.layer_kv_config
         self.decoding_config = vllm_config.decoding_config or DecodingConfig(  # noqa
         )
         self.prompt_adapter_config = vllm_config.prompt_adapter_config  # noqa
@@ -265,6 +269,11 @@ class LLMEngine:
             self.tokenizer = None
             self.detokenizer = None
             tokenizer_group = None
+            
+        if self.scheduler_config.enable_slo_scheduler:
+            self.predictor = self._init_predictor()
+        else:
+            self.predictor = None
 
         # Ensure that the function doesn't contain a reference to self,
         # to avoid engine GC issues
@@ -361,14 +370,41 @@ class LLMEngine:
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        self.scheduler = [
-            Scheduler(
-                self.scheduler_config, self.cache_config, self.lora_config,
-                self.parallel_config.pipeline_parallel_size,
-                self.async_callbacks[v_id]
-                if self.model_config.use_async_output_proc else None)
-            for v_id in range(self.parallel_config.pipeline_parallel_size)
-        ]
+        # SLO scheduler
+        self.alpha = self.layer_kv_config.prefill_alpha
+        self.beta = self.layer_kv_config.offload_beta
+        self.parameters = self.model_executor.get_parameters()
+        if self.cache_config.cache_dtype == "auto":
+            self.dtype = self.model_config.dtype
+        else:
+            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
+
+        if self.scheduler_config.enable_slo_scheduler:
+            self.scheduler = [
+                Scheduler(
+                    self.scheduler_config, self.cache_config, self.lora_config,
+                    self.layer_kv_config,
+                    self.parallel_config.pipeline_parallel_size,
+                    self.async_callbacks[v_id]
+                    if self.model_config.use_async_output_proc else None,
+                    # parameters=self.parameters,
+                    num_layers=self.model_config.get_num_layers(self.parallel_config),
+                    num_heads=self.model_config.get_num_kv_heads(self.parallel_config),
+                    head_dim=self.model_config.get_head_size(),
+                    dtype=self.dtype,
+                    )
+                for v_id in range(self.parallel_config.pipeline_parallel_size)
+            ]
+        else:
+            self.scheduler = [
+                Scheduler(
+                    self.scheduler_config, self.cache_config, self.lora_config,
+                    self.layer_kv_config,
+                    self.parallel_config.pipeline_parallel_size,
+                    self.async_callbacks[v_id]
+                    if self.model_config.use_async_output_proc else None)
+                for v_id in range(self.parallel_config.pipeline_parallel_size)
+            ]
 
         # Metric Logging.
         if self.log_stats:
@@ -452,7 +488,10 @@ class LLMEngine:
         distributed_executor_backend = (
             engine_config.parallel_config.distributed_executor_backend)
         # Initialize the cluster and specify the executor class.
-        if isinstance(distributed_executor_backend, type):
+        if engine_config.layer_kv_config.enable_layer_wise_cache:
+            from vllm.executor.layer_wise_gpu_executor import LayerWiseGPUExecutor
+            executor_class = LayerWiseGPUExecutor
+        elif isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, ExecutorBase):
                 raise TypeError(
                     "distributed_executor_backend must be a subclass of "
@@ -571,6 +610,12 @@ class LLMEngine:
         lora_request: Optional[LoRARequest] = None,
     ) -> AnyTokenizer:
         return self.get_tokenizer_group().get_lora_tokenizer(lora_request)
+    
+    def get_predictor(self) -> OutputTokenLengthPredictor:
+        return self.predictor
+        
+    def _init_predictor(self) -> OutputTokenLengthPredictor:
+        return OutputTokenLengthPredictor(scheduler_config=self.scheduler_config,)
 
     def _init_tokenizer(self) -> BaseTokenizerGroup:
         return init_tokenizer_from_configs(
@@ -590,6 +635,23 @@ class LLMEngine:
             self.prompt_adapter_config.verify_with_model_config(
                 self.model_config)
 
+    def _calculate_prefill_time(self, seqlen: int) -> float:
+        """计算预填充时间"""
+        # 根据序列长度的超线性关系估算
+        num_hidden_layers = self.model_config.get_num_layers(self.parallel_config)
+        FLOP = self.layer_kv_config.device_flops
+        assert (FLOP is not None and self.alpha > 0)
+        return self.alpha * seqlen * \
+                (2 * self.parameters + 2 * seqlen * num_hidden_layers) \
+                / FLOP
+
+    def _predict(self, inputs: ProcessorInputs) -> int:
+        assert self.scheduler_config.enable_slo_scheduler
+        predictor = self.get_predictor()
+        tokenizer = self.get_tokenizer()
+        assert predictor
+        return predictor.predict(inputs, tokenizer)
+
     def _add_processed_request(
         self,
         request_id: str,
@@ -600,6 +662,8 @@ class LLMEngine:
         prompt_adapter_request: Optional[PromptAdapterRequest],
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
+        predict_token_len: Optional[int] = None,
+        estimate_prefill_time: Optional[float] = None,
     ) -> Optional[SequenceGroup]:
         """Add a processed request to the engine's request pool.
         return the created sequence group.
@@ -632,7 +696,8 @@ class LLMEngine:
             encoder_inputs = None
 
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
-                       lora_request, prompt_adapter_request)
+                       lora_request, prompt_adapter_request,
+                       predict_token_len, estimate_prefill_time)
 
         encoder_seq = (None if encoder_inputs is None else Sequence(
             seq_id, encoder_inputs, block_size, eos_token_id, lora_request,
@@ -802,6 +867,14 @@ class LLMEngine:
         )
         processed_inputs = self.input_processor(preprocessed_inputs)
 
+        predict_token_len = None
+        estimate_prefill_time = None
+        if self.scheduler_config.enable_slo_scheduler:
+            predict_token_len = self._predict(inputs=preprocessed_inputs,)
+            print("prediction len of request", request_id,": ", predict_token_len)
+            seqlen = len(processed_inputs["prompt_token_ids"])
+            estimate_prefill_time = self._calculate_prefill_time(seqlen)
+
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,
@@ -811,6 +884,8 @@ class LLMEngine:
             prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
             priority=priority,
+            predict_token_len=predict_token_len,
+            estimate_prefill_time=estimate_prefill_time,
         )
 
     def _validate_token_prompt(self, prompt: PromptType,
@@ -1350,9 +1425,13 @@ class LLMEngine:
         # batch has completed.
         if not self._has_remaining_steps(seq_group_metadata_list):
             # Schedule iteration
-            (seq_group_metadata_list, scheduler_outputs,
-             allow_async_output_proc
-             ) = self.scheduler[virtual_engine].schedule()
+            if self.scheduler_config.enable_slo_scheduler:
+                (seq_group_metadata_list, scheduler_outputs,
+                 allow_async_output_proc) = self.scheduler[virtual_engine].schdule_layerwise()
+            else:
+                (seq_group_metadata_list, scheduler_outputs,
+                allow_async_output_proc
+                ) = self.scheduler[virtual_engine].schedule()
 
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs

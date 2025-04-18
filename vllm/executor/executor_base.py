@@ -63,6 +63,11 @@ class ExecutorBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_parameters(self) -> int:
+        """Get the parameters of the model."""
+        raise NotImplementedError
+    
+    @abstractmethod
     def execute_model(
         self, execute_model_req: ExecuteModelRequest
     ) -> Optional[List[SamplerOutput]]:

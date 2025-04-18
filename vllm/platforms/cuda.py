@@ -116,7 +116,10 @@ class CudaPlatformBase(Platform):
         scheduler_config = vllm_config.scheduler_config
 
         if parallel_config.worker_cls == "auto":
-            if scheduler_config.is_multi_step:
+            if vllm_config.layer_kv_config.enable_layer_wise_cache:
+                parallel_config.worker_cls = \
+                    "vllm.worker.layer_wise_worker.LayerWiseWorker"
+            elif scheduler_config.is_multi_step:
                 if envs.VLLM_USE_V1:
                     raise NotImplementedError
                 else:

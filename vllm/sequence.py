@@ -401,6 +401,9 @@ class Sequence:
         prediction_token_len: Prediction num of generate tokens.
     """
 
+    # multi_cls_thresholds = [0, 58, 147, 280, 499, 512]
+    multi_cls_thresholds = [5, 20, 48, 115, 512, 512]
+
     def __init__(
         self,
         seq_id: int,
@@ -410,7 +413,7 @@ class Sequence:
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         predict_token_len: Optional[int] = None,
-        estimate_prefill_time: Optional[float] = None,
+        estimate_prefill_time: Optional[float] = 10,
     ) -> None:
         self.seq_id = seq_id
         self.inputs = SingletonInputsAdapter(inputs)
@@ -879,9 +882,10 @@ class SequenceGroupMetadataDelta(
     """
     seq_data_delta: Dict[int, SequenceDataDelta]
     request_id: str
-    block_tables: Dict[int, List[int]]
     is_prompt: bool
     do_sample: bool = True
+    block_tables: Optional[Dict[int, List[int]]] = None
+    layer_block_tables: Optional[Dict[int, Dict[int, List[int]]]] = None
     token_chunk_size: Optional[int] = None
     computed_block_nums: Optional[List[int]] = None
     state: Optional[SequenceGroupState] = msgspec.field(
@@ -929,8 +933,9 @@ class SequenceGroupMetadata(
     is_prompt: bool
     seq_data: Dict[int, SequenceData]
     sampling_params: Optional[SamplingParams]
-    block_tables: Dict[int, List[int]]
     do_sample: bool = True
+    block_tables: Optional[Dict[int, List[int]]] = None
+    layer_block_tables: Optional[Dict[int, Dict[int, List[int]]]] = None
     pooling_params: Optional[PoolingParams] = None
     lora_request: Optional[LoRARequest] = None
     computed_block_nums: Optional[List[int]] = None
@@ -996,6 +1001,7 @@ class SequenceGroupMetadata(
             self.seq_data[id].apply_delta(delta)
         assert self.request_id == sequence_group_metadata_delta.request_id
         self.block_tables = sequence_group_metadata_delta.block_tables
+        self.layer_block_tables = sequence_group_metadata_delta.layer_block_tables
         self.token_chunk_size = sequence_group_metadata_delta.token_chunk_size
         self.do_sample = sequence_group_metadata_delta.do_sample
         self.is_prompt = sequence_group_metadata_delta.is_prompt
@@ -1005,6 +1011,46 @@ class SequenceGroupMetadata(
         assert self.state.current_step < self.state.num_steps, \
             f"current step {self.state.current_step}, num_steps {self.state.num_steps}" # noqa
         self.state.current_step += 1
+
+# class SequenceGroupLayerWiseMetadataDelta(SequenceGroupMetadataDelta):
+    # layer_block_tables: Dict[int, Dict[int, List[int]]]
+    # seq_data_delta: Dict[int, SequenceDataDelta]
+    # request_id: str
+    # is_prompt: bool
+    # do_sample: bool = True
+    # token_chunk_size: Optional[int] = None
+    # computed_block_nums: Optional[List[int]] = None
+    # state: Optional[SequenceGroupState] = msgspec.field(
+    #     default_factory=lambda: SequenceGroupState())
+
+
+# class SequenceGroupLayerWiseMetadata(SequenceGroupMetadata):
+#     layer_block_tables: Dict[int, Dict[int, List[int]]]
+#     request_id: str
+#     is_prompt: bool
+#     seq_data: Dict[int, SequenceData]
+#     sampling_params: Optional[SamplingParams]
+#     do_sample: bool = True
+#     pooling_params: Optional[PoolingParams] = None
+#     lora_request: Optional[LoRARequest] = None
+#     computed_block_nums: Optional[List[int]] = None
+#     state: Optional[SequenceGroupState] = msgspec.field(
+#         default_factory=lambda: SequenceGroupState())
+#     # "MultiModalDataDict" types. We have to use Any due to msgspec
+#     # doesn't allow to have union of 2 different dicts.
+#     token_type_ids: Optional[List[int]] = None
+#     multi_modal_data: Optional[Any] = None
+#     multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None
+#     mm_processor_kwargs: Optional[Dict[str, Any]] = None
+#     encoder_seq_data: Optional[SequenceData] = None
+#     cross_block_table: Optional[List[int]] = None
+#     prompt_adapter_request: Optional[PromptAdapterRequest] = None
+#     token_chunk_size: Optional[int] = None
+
+#     def apply_delta(self,
+#                     sequence_group_metadata_delta: SequenceGroupLayerWiseMetadataDelta):
+#         super().apply_delta(sequence_group_metadata_delta)
+#         self.layer_block_tables = sequence_group_metadata_delta.layer_block_tables
 
 
 class SequenceOutput(

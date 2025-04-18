@@ -57,13 +57,21 @@ class BertRegressionModel(nn.Module):
         return output
 
 class OutputTokenLengthPredictor:
-    multi_cls_thresholds =  [58, 147, 280, 499, 512]
+    multi_cls_thresholds = [20, 48, 115, 512, 100000]
     def __init__(self,
                  scheduler_config: SchedulerConfig,):
-        self.device = 'cpu'    
-        self.tokenizer = AutoTokenizer.from_pretrained('/home/panenbao/models/bert-base-uncased')
+        self.device = 'cuda:0'    
+        self.max_len = scheduler_config.max_model_len
+        self.tokenizer = AutoTokenizer.from_pretrained('/mnt/HDD0/panenbao/models/bert-base-uncased')
         self.tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
-        self.model: BertClassificationModel = torch.load(scheduler_config.predictor_path, map_location=self.device)
+        predictor_path = scheduler_config.predictor_path
+        # predictor_path = predictor_path + '/predictions_llama-2-7b-hf_multi_cls_lowwer_than_' \
+        #                  + str(self.max_len) + '.pth'
+        # predictor_path = predictor_path + '/predictions_llama-2-7b-hf_multi_cls_lowwer_than_' \
+        #                   + str(512) + '.pth'
+        # predictor_path = '/mnt/HDD0/panenbao/models/predictions_llama-2-7b-hf_multi_cls_512_new.pth'
+        predictor_path = '/mnt/HDD0/panenbao/models/predictions_llama-2-7b-hf_multi_cls_1024.pth'
+        self.model: BertClassificationModel = torch.load(predictor_path, map_location=self.device)
         self.model.to(device=self.device)
         self.model.eval()
 
@@ -73,13 +81,20 @@ class OutputTokenLengthPredictor:
         encoding = self.tokenizer(
             prompt,
             return_tensors='pt',
-            max_length=512,
+            max_length=self.max_len,
             truncation=True
         ).to(self.device)
+        if len(encoding['input_ids']) > self.max_len:
+            encoding['input_ids'] = encoding['input_ids'][-self.max_len: ]
+            encoding['token_type_ids'] = encoding['token_type_ids'][-self.max_len: ]
+            encoding['attention_mask'] = encoding['attention_mask'][-self.max_len: ]
+            
         with torch.no_grad():
             logits = self.model(encoding['input_ids'], encoding['attention_mask'])
             pred = torch.argmax(logits, dim=-1).item()
-        return self.multi_cls_thresholds[pred]
+        # return self.multi_cls_thresholds[pred]
+        print(pred)
+        return pred
 
     def predict(self, inputs: ProcessorInputs, tokenizer: AutoTokenizer) -> int:
         if 'prompt' in inputs:

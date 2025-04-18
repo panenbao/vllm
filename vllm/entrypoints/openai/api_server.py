@@ -65,6 +65,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address)
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.prediction_utils.predictor import BertClassificationModel
 
 if envs.VLLM_USE_V1:
     from vllm.v1.engine.async_llm import AsyncLLMEngine  # type: ignore

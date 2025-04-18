@@ -14,7 +14,7 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          ModelConfig, ObservabilityConfig, ParallelConfig,
                          PoolerConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig, TaskOption, TokenizerPoolConfig,
-                         VllmConfig)
+                         VllmConfig, LayerKVConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -118,7 +118,8 @@ class EngineArgs:
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
     cpu_offload_gb: float = 0  # GiB
-    gpu_memory_utilization: float = 0.90
+    # gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.70
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: Optional[int] = None
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
@@ -196,16 +197,18 @@ class EngineArgs:
     worker_cls: str = "auto"
 
     # LayerKV settings    
-    enable_slo_scheduler: bool = False
-    slo_ttft: Optional[float] = None
-    slo_tpot: Optional[float] = None
-    predictor_path: Optional[str] = None
-    enable_layer_wise_cache: bool = False
+    enable_slo_scheduler: bool = True
+    slo_ttft: Optional[float] = 1000
+    slo_tpot: Optional[float] = 200
+    predictor_path: Optional[str] = "/mnt/HDD0/panenbao/models"
+    enable_layer_wise_cache: bool = True
     # empirical correction factors
     # alpha for estimate the prefill time for each request
-    alpha: Optional[float] = None
+    estimate_prefill_alpha_factor: Optional[float] = 1089.321656324961
     # beta for estimate the offloading time from GPU to CPU
-    beta: Optional[float] = None
+    estimate_offload_beta_factor: Optional[float] = 0.0000003531196332461630412455962785278629
+    device_flops: Optional[float] = 1.95e13
+    pcie_bandwidth: Optional[float] = 64.0
     
     kv_transfer_config: Optional[KVTransferConfig] = None
 
@@ -957,7 +960,7 @@ class EngineArgs:
         parser.add_argument(
             '--enable-slo-scheduler',
             action='store_true',
-            default=False,
+            default=True,
             help='Enable SLO scheduler')
         
         parser.add_argument(
@@ -973,29 +976,41 @@ class EngineArgs:
             help='TPOT SLO for SLO scheduler, ms.')
         
         parser.add_argument(
-            '--alpha',
+            '--estimate-prefill-alpha-factor',
             type=float,
-            default=4.244634539569536,
+            default=1089.321656324961,
             help='alpha for estimate the prefill time for each request')
         
         parser.add_argument(
-            '--beta',
+            '--estimate-offload-beta-factor',
             type=float,
-            default=0.0,
+            default=1.0,
             help='beta for estimate the offloading time from GPU to CPU')
         
         parser.add_argument(
             '--predictor-path',
             type=str,
-            default="/home/panenbao/models/predictions_llama-2-7b-hf_multi_cls_lowwer_than_512.pth",
+            default="/mnt/HDD0/panenbao/models",
             help='Path od predictor for slo-aware scheduler.')
         
         # KV cache
         parser.add_argument(
             '--enable-layer-wise-cache',
             action='store_true',
-            default=False,
+            default=True,
             help='Enable layer-wise cache management. ')
+        
+        parser.add_argument(
+            '--device-flops',
+            type=float,
+            default=1.95e13,
+            help='The flops for the device.')
+        
+        parser.add_argument(
+            '--pcie-bandwidth',
+            type=float,
+            default=64.0,
+            help='The bandwidth of the PCIe. GB/s')
         
         return parser
 
@@ -1235,8 +1250,16 @@ class EngineArgs:
             enable_slo_scheduler=self.enable_slo_scheduler,
             slo_ttft=self.slo_ttft,
             slo_tpot=self.slo_tpot,
-            predictor_path=self.predictor_path,
-            alpha=self.alpha,)
+            # estimate_prefill_alpha_factor = self.estimate_prefill_alpha_factor,
+            # estimate_offload_beta_factor = self.estimate_offload_beta_factor,
+            predictor_path=self.predictor_path,)
+        layer_kv_config = LayerKVConfig(
+            enable_layer_wise_cache=self.enable_layer_wise_cache,
+            pcie_bandwidth=self.pcie_bandwidth,
+            device_flops=self.device_flops,
+            prefill_alpha=self.estimate_prefill_alpha_factor,
+            offload_beta=self.estimate_offload_beta_factor,
+        )
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,
@@ -1295,6 +1318,7 @@ class EngineArgs:
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
+            layer_kv_config=layer_kv_config,
         )
 
         if envs.VLLM_USE_V1:

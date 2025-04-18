@@ -361,7 +361,6 @@ class LlamaModel(nn.Module):
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches,
                                             attn_metadata[i], residual,)
-                                            # self.cache_engine)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -563,7 +562,7 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: torch.Tensor,
-        attn_metadata:List[AttentionMetadata],
+        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:

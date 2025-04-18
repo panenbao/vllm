@@ -20,7 +20,7 @@ def create_worker(**kwargs):
     return wrapper.worker
 
 
-class GPUExecutor(ExecutorBase):
+class LayerWiseGPUExecutor(ExecutorBase):
 
     uses_ray: bool = False
 
@@ -139,7 +139,7 @@ class GPUExecutor(ExecutorBase):
         self.driver_worker.stop_profile()
 
 
-class GPUExecutorAsync(GPUExecutor, ExecutorAsyncBase):
+class LayerWiseGPUExecutorAsync(LayerWiseGPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
         self,

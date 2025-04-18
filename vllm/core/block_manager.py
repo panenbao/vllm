@@ -1,7 +1,6 @@
 """A block manager that manages token blocks."""
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from typing import Sequence as GenericSequence
-from typing import Tuple
 
 from vllm.core.block.block_table import BlockTable
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
@@ -11,7 +10,9 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from vllm.utils import Device
+from vllm.utils import Device, get_dtype_size
+
+from torch import dtype
 
 SeqId = int
 EncoderSeqId = str
@@ -258,7 +259,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # Update seq block ids with the latest access time
         self._last_access_blocks_tracker.update_seq_blocks_last_access(
-            seq_id, self.block_tables[seq.seq_id].physical_block_ids)
+            seq_id, self.block_tables[seq_id].physical_block_ids)
 
         # Untrack seq
         self._last_access_blocks_tracker.remove_seq(seq_id)
@@ -514,3 +515,393 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         cached in the block manager for the sequence.
         """
         return self._computed_blocks_tracker.get_num_cached_tokens(seq)
+
+
+
+class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
+    def __init__(
+        self,
+        block_size: int,
+        num_gpu_blocks: int,
+        num_cpu_blocks: int,
+        watermark: float = 0.01,
+        sliding_window: Optional[int] = None,
+        enable_caching: bool = False,
+        num_layers: int = None,
+        head_dim: int = None,
+        num_heads: int = None,
+        pcie_bandwidth: float = None,
+        beta: float = None,
+        dtype: dtype = None,
+    ) -> None:
+        super().__init__(block_size, num_gpu_blocks, num_cpu_blocks, watermark,
+                         sliding_window, enable_caching)
+        self.num_layers = num_layers
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+         # 每层的KV缓存块分配状态
+        self.layer_block_tables: Dict[SeqId, Dict[int, Tuple[Device, BlockTable]]] = {}
+        
+        # 每层GPU KV块的使用状态
+        self.layer_gpu_blocks: Dict[int, Set[int]] = {
+            i: set() for i in range(num_layers)
+        }
+        
+        self.layer_cpu_blocks: Dict[int, Set[int]] = {
+            i: set() for i in range(num_layers)
+        }
+        
+        # PCIe带宽参数 (GB/s)
+        self.pcie_bandwidth = pcie_bandwidth
+        
+        # 经验校正因子
+        self.beta = beta
+        
+        self.dtype = dtype
+
+    def get_num_free_gpu_blocks(self) -> int:
+        return self.block_allocator.get_num_free_blocks(Device.GPU)
+
+    def calculate_min_gpu_layers(self, seq: Sequence)-> int:
+        """计算需要保留在GPU中的最小层数"""
+        # 预填充时间
+        Tprefill = seq.estimate_prefill_time
+        if not Tprefill:
+            Tprefill = 0.001
+        seqlen = seq.get_len()
+        
+        L = self.num_layers
+        dheads = self.head_dim
+        nheads = self.num_heads
+        fprecision = get_dtype_size(self.dtype)
+        
+        # 二分查找最小的x值满足条件
+        left, right = 0, L
+        while left < right:
+            x = (left + right) // 2
+            Toffload = self._calculate_offload_time(seqlen, L, x, dheads, 
+                                                  nheads, fprecision)
+            if Toffload <= Tprefill:
+                right = x
+            else:
+                left = x + 1
+        return left
+
+    def _calculate_offload_time(self, seqlen: int, L: int, x: int, 
+                              dheads: int, nheads: int, fprecision: float) -> float:
+        """计算卸载时间"""
+        return (self.beta * seqlen * 2 * (L - x) * dheads * nheads * 
+                fprecision / self.pcie_bandwidth)
+
+    def can_allocate(self,
+                     seq_group: SequenceGroup,
+                     num_lookahead_slots: int = 0) -> AllocStatus:
+        # FIXME(woosuk): Here we assume that all sequences in the group share
+        # the same prompt. This may not be true for preempted sequences.
+
+        check_no_caching_or_swa_for_blockmgr_encdec(self, seq_group)
+
+        seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
+
+        num_required_blocks = BlockTable.get_num_required_blocks(
+            seq.get_token_ids(),
+            block_size=self.block_size,
+            num_lookahead_slots=num_lookahead_slots,
+        )
+
+        if seq_group.is_encoder_decoder():
+            encoder_seq = seq_group.get_encoder_seq()
+            assert encoder_seq is not None
+            num_required_blocks += BlockTable.get_num_required_blocks(
+                encoder_seq.get_token_ids(),
+                block_size=self.block_size,
+            )
+
+        if self.max_block_sliding_window is not None:
+            num_required_blocks = min(num_required_blocks,
+                                      self.max_block_sliding_window)
+        num_required_blocks *= self.num_layers
+        
+        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
+            device=Device.GPU)
+
+        # Use watermark to avoid frequent cache eviction.
+        if (self.num_total_gpu_blocks - num_required_blocks <
+                self.watermark_blocks):
+            return AllocStatus.NEVER
+        if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
+            return AllocStatus.OK
+        else:
+            return AllocStatus.LATER
+
+    # def _allocate_sequence(self, seq: Sequence) -> BlockTable:
+    #     block_table = BlockTable(
+    #         block_size=self.block_size,
+    #         block_allocator=self.block_allocator,
+    #         max_block_sliding_window=self.max_block_sliding_window,
+    #     )
+    #     if seq.get_token_ids():
+    #         # NOTE: If there are any factors affecting the block besides
+    #         # token_ids, they should be added as input to extra_hash.
+    #         extra_hash = seq.extra_hash()
+
+    #         # Add blocks to the block table only if the sequence is non empty.
+    #         block_table.allocate(token_ids=seq.get_token_ids(),
+    #                              extra_hash=extra_hash)
+
+    #     return block_table
+
+    def _allocate_sequence_layer(
+        self, 
+        seq: Sequence,
+        layer_id: int, 
+        device: Device
+    ) -> BlockTable:
+        """为序列的某一层分配block table
+        
+        Args:
+            seq: 要分配的序列
+            layer_id: 层编号
+            device: 分配设备(GPU/CPU)
+            
+        Returns:
+            该层的block table
+        """
+        block_table = BlockTable(
+            block_size=self.block_size,
+            block_allocator=self.block_allocator,
+            max_block_sliding_window=self.max_block_sliding_window,
+        )
+        
+        if seq.get_token_ids():
+            block_table.allocate(
+                token_ids=seq.get_token_ids(),
+                device=device,
+                extra_hash=seq.extra_hash()
+            )
+            
+        return block_table
+
+    def predict_available_blocks(
+        self, 
+        current_available: int,
+        # released: int,
+        # allocated: int
+        ) -> int:
+        """预测未来阶段的可用GPU块数量
+        """
+        # 计算当前可用块数
+        avail = current_available
+        # 计算当前正在处理的处于decode阶段的请求数，假设一个请求需要一个新的块
+        num_decode = 0
+        # 当前所有prefill阶段的请求需要分配的块数
+        num_prefill_allocate = 0
+        # 可能会释放的块数，对每个请求的生成长度预测区间中值进行估计
+        num_released = 0
+        num_allocated = num_decode + num_prefill_allocate
+        return 1000
+        # # 预测该时间步释放的块数
+        # released = self._estimate_released_blocks(t)
+        
+        # # 预测该时间步分配的块数 
+        # allocated = self._estimate_allocated_blocks(t)
+        
+        # # 更新可用块数
+        # avail = avail + released - allocated
+        # return 
+
+    def allocate(self, seq_group: SequenceGroup) -> None:
+
+        # Allocate self-attention block tables for decoder sequences
+        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+        assert not (set(seq.seq_id for seq in waiting_seqs)
+                    & self.block_tables.keys()), "block table already exists"
+
+        # NOTE: Here we assume that all sequences in the group have the same
+        # prompt.
+        seq = waiting_seqs[0]
+        
+        # 计算需要在GPU保留的最少层数
+        min_gpu_layers = self.calculate_min_gpu_layers(seq)
+        print(f"seq_id: {seq.seq_id}, seqlen: {seq.get_len()}")
+        print(f"min_gpu_layers: {min_gpu_layers}")
+        
+        
+        # 预测未来GPU块资源
+        # avail_blocks = self.predict_available_blocks(
+        #     self.block_allocator.get_num_free_blocks(Device.GPU))
+        
+        #  # 根据资源状况决定实际在GPU保留的层数 
+        # if avail_blocks < self.watermark_blocks:
+        #     # GPU资源紧张,减少GPU层数
+        #     actual_gpu_layers = min_gpu_layers // 2
+        # else:
+        #     actual_gpu_layers = min_gpu_layers
+
+        # 为每一层分配块
+        for layer_id in range(self.num_layers):
+            # 分配GPU或CPU块
+            # device = Device.GPU if layer_id < actual_gpu_layers else Device.CPU
+            device = Device.GPU
+            
+            # 创建该层的block table
+            block_table = self._allocate_sequence_layer(seq, layer_id, device)
+            
+            # 记录分配状态
+            if seq.seq_id not in self.layer_block_tables:
+                self.layer_block_tables[seq.seq_id] = {}
+            self.layer_block_tables[seq.seq_id][layer_id] = (device, block_table)
+            
+            if device == Device.GPU:
+                self.layer_gpu_blocks[layer_id].update(
+                    block_table.physical_block_ids)
+            else:
+                self.layer_cpu_blocks[layer_id].update(
+                    block_table.physical_block_ids)
+        
+        for seq_id in self.layer_block_tables:
+            print(f"seq_id: {seq_id}, layer_block_tables: {self.layer_block_tables[seq_id]}")
+            
+            
+
+    def can_append_slots(self, seq_group: SequenceGroup,
+                         num_lookahead_slots: int) -> bool:
+        """Determine if there is enough space in the GPU KV cache to continue
+        generation of the specified sequence group.
+
+        We use a worst-case heuristic: assume each touched block will require a
+        new allocation (either via CoW or new block). We can append slots if the
+        number of touched blocks is less than the number of free blocks.
+
+        "Lookahead slots" are slots that are allocated in addition to the slots
+        for known tokens. The contents of the lookahead slots are not defined.
+        This is used by speculative decoding when speculating future tokens.
+        """
+
+        num_touched_blocks = 0
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            for layer_id in range(self.num_layers):
+                block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
+                num_touched_blocks += (
+                block_table.get_num_blocks_touched_by_append_slots(
+                    token_ids=block_table.get_unseen_token_ids(
+                        seq.get_token_ids()),
+                    num_lookahead_slots=num_lookahead_slots,
+                ))
+            # block_table = self.block_tables[seq.seq_id]
+
+            # num_touched_blocks += (
+            #     block_table.get_num_blocks_touched_by_append_slots(
+            #         token_ids=block_table.get_unseen_token_ids(
+            #             seq.get_token_ids()),
+            #         num_lookahead_slots=num_lookahead_slots,
+            #     ))
+
+        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
+            Device.GPU)
+        return num_touched_blocks <= num_free_gpu_blocks
+
+    def append_slots(
+        self,
+        seq: Sequence,
+        num_lookahead_slots: int,
+    ) -> List[Tuple[int, int]]:
+        for layer_id in range(self.num_layers):
+            block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
+            block_table.append_token_ids(
+                token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
+                num_lookahead_slots=num_lookahead_slots,
+                num_computed_slots=seq.data.get_num_computed_tokens(),
+                extra_hash=seq.extra_hash(),
+            )
+        # block_table = self.block_tables[seq.seq_id]
+
+        # block_table.append_token_ids(
+        #     token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
+        #     num_lookahead_slots=num_lookahead_slots,
+        #     num_computed_slots=seq.data.get_num_computed_tokens(),
+        #     extra_hash=seq.extra_hash(),
+        # )
+        # Return any new copy-on-writes.
+        new_cows = self.block_allocator.clear_copy_on_writes()
+        return new_cows
+
+    def free(self, seq: Sequence) -> None:
+        """释放序列占用的所有资源
+        
+        需要释放每一层的blocks。
+        """
+        # 释放每一层的blocks
+        seq_id = seq.seq_id
+        
+        if seq_id not in self.block_tables:
+            # Already freed or haven't been scheduled yet.
+            return
+
+        for layer_id in range(self.num_layers):
+            if seq_id in self.layer_block_tables and layer_id in self.layer_block_tables[seq_id]:
+                device, block_table = self.layer_block_tables[seq_id][layer_id]
+                if not block_table:
+                    continue
+                    
+                # 从block集合中移除
+                if device == Device.GPU:
+                    self.layer_gpu_blocks[layer_id].difference_update(
+                        block_table.physical_block_ids)
+                else:
+                    self.layer_cpu_blocks[layer_id].difference_update(
+                        block_table.physical_block_ids)
+                    
+                # 释放block table
+                block_table.free()
+                del self.layer_block_tables[seq_id][layer_id]
+        
+        # 如果该层的block table已经被释放，则删除
+        del self.layer_block_tables[seq_id]
+
+    def free_cross(self, seq_group: SequenceGroup) -> None:
+        request_id = seq_group.request_id
+        if request_id not in self.cross_block_tables:
+            # Already freed or hasn't been scheduled yet.
+            return
+        self.cross_block_tables[request_id].free()
+        del self.cross_block_tables[request_id]
+
+    def get_block_table(self, seq: Sequence) -> Dict[int, List[int]]:
+        block_ids = {}
+        # 获取每一层的block ids
+        for layer_id in range(self.num_layers):
+            block_ids_cur_layer = self.layer_block_tables[seq.seq_id][layer_id][1].physical_block_ids
+            block_ids[layer_id] = block_ids_cur_layer
+        return block_ids  # type: ignore
+
+    def get_cross_block_table(self, seq_group: SequenceGroup) -> List[int]:
+        request_id = seq_group.request_id
+        assert request_id in self.cross_block_tables
+        block_ids = self.cross_block_tables[request_id].physical_block_ids
+        assert all(b is not None for b in block_ids)
+        return block_ids  # type: ignore
+
+    def access_all_blocks_in_seq(self, seq: Sequence, now: float):
+        if self.enable_caching:
+            # Record the latest access time for the sequence. The actual update
+            # of the block ids is deferred to the sequence free(..) call, since
+            # only during freeing of block ids, the blocks are actually added to
+            # the evictor (which is when the most updated time is required)
+            # (This avoids expensive calls to mark_blocks_as_accessed(..))
+            self._last_access_blocks_tracker.update_last_access(
+                seq.seq_id, now)
+
+    def mark_blocks_as_computed(self, seq_group: SequenceGroup,
+                                token_chunk_size: int):
+        # If prefix caching is enabled, mark immutable blocks as computed
+        # right after they have been scheduled (for prefill). This assumes
+        # the scheduler is synchronous so blocks are actually computed when
+        # scheduling the next batch.
+        self.block_allocator.mark_blocks_as_computed([])
+
+    def get_num_free_gpu_blocks(self) -> int:
+        return self.block_allocator.get_num_free_blocks(Device.GPU)
+
+    def get_num_free_cpu_blocks(self) -> int:
+        return self.block_allocator.get_num_free_blocks(Device.CPU)
