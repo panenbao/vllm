@@ -62,6 +62,7 @@ class OutputTokenLengthPredictor:
                  scheduler_config: SchedulerConfig,):
         self.device = 'cuda:0'    
         self.max_len = scheduler_config.max_model_len
+        self.max_len = 1024
         self.tokenizer = AutoTokenizer.from_pretrained('/mnt/HDD0/panenbao/models/bert-base-uncased')
         self.tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
         predictor_path = scheduler_config.predictor_path
@@ -82,7 +83,8 @@ class OutputTokenLengthPredictor:
             prompt,
             return_tensors='pt',
             max_length=self.max_len,
-            truncation=True
+            truncation=True,
+            padding='max_length',
         ).to(self.device)
         if len(encoding['input_ids']) > self.max_len:
             encoding['input_ids'] = encoding['input_ids'][-self.max_len: ]

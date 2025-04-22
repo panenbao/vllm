@@ -56,6 +56,7 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm.model_executor.cuda_utils import KVCacheTransferManager
 
 
 class LlamaMLP(nn.Module):

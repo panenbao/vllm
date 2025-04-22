@@ -402,7 +402,8 @@ class Sequence:
     """
 
     # multi_cls_thresholds = [0, 58, 147, 280, 499, 512]
-    multi_cls_thresholds = [5, 20, 48, 115, 512, 512]
+    # multi_cls_thresholds = [5, 20, 48, 115, 512, 512]
+    multi_cls_thresholds = [5, 16, 35, 48, 66, 145, 1024]
 
     def __init__(
         self,
