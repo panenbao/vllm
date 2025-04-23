@@ -540,7 +540,7 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         self.head_dim = head_dim
         self.num_heads = num_heads
          # 每层的KV缓存块分配状态
-        self.layer_block_tables: Dict[SeqId, Dict[int, Tuple[Device, BlockTable]]] = {}
+        self.layer_block_tables: Dict[SeqId, Dict[int, Dict[Device, BlockTable]]] = {}
         
         # 每层GPU KV块的使用状态
         self.layer_gpu_blocks: Dict[int, Set[int]] = {
@@ -710,7 +710,7 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         # avail = avail + released - allocated
         # return 
 
-    def allocate(self, seq_group: SequenceGroup) -> None:
+    def allocate(self, seq_group: SequenceGroup) -> int:
 
         # Allocate self-attention block tables for decoder sequences
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
@@ -742,25 +742,47 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         for layer_id in range(self.num_layers):
             # 分配GPU或CPU块
             # device = Device.GPU if layer_id < actual_gpu_layers else Device.CPU
+            # 第0、2、4、6等偶数层使用相同的GPU块，不同的CPU块
             device = Device.GPU
+
+            if seq.seq_id not in self.layer_block_tables:
+                self.layer_block_tables[seq.seq_id] = {}
+
+            if layer_id % 2 == 0:
+                if layer_id == 0:
+                    block_table = self._allocate_sequence_layer(seq, layer_id, device)
+                    assert seq.seq_id in self.layer_block_tables
+                    if layer_id not in self.layer_block_tables[seq.seq_id]:
+                        self.layer_block_tables[seq.seq_id][layer_id] = {}
+                    self.layer_block_tables[seq.seq_id][layer_id][device] = block_table
+                    self.layer_gpu_blocks[layer_id].update(block_table.physical_block_ids)
+                else:
+                    assert (self.layer_block_tables[seq.seq_id] and self.layer_block_tables[seq.seq_id][layer_id - 2]
+                        and self.layer_block_tables[seq.seq_id][layer_id - 2][Device.GPU])
+                    if layer_id not in self.layer_block_tables[seq.seq_id]:
+                        self.layer_block_tables[seq.seq_id][layer_id] = {}
+                    # 重用GPU块
+                    self.layer_block_tables[seq.seq_id][layer_id][Device.GPU] \
+                        = self.layer_block_tables[seq.seq_id][layer_id - 2][Device.GPU]
+                # 继续在CPU上进行分配
+                device = Device.CPU
             
             # 创建该层的block table
             block_table = self._allocate_sequence_layer(seq, layer_id, device)
-            
+            if layer_id not in self.layer_block_tables[seq.seq_id]:
+                        self.layer_block_tables[seq.seq_id][layer_id] = {}
+            self.layer_block_tables[seq.seq_id][layer_id][device] = block_table
             # 记录分配状态
-            if seq.seq_id not in self.layer_block_tables:
-                self.layer_block_tables[seq.seq_id] = {}
-            self.layer_block_tables[seq.seq_id][layer_id] = (device, block_table)
-            
             if device == Device.GPU:
                 self.layer_gpu_blocks[layer_id].update(
                     block_table.physical_block_ids)
             else:
                 self.layer_cpu_blocks[layer_id].update(
                     block_table.physical_block_ids)
-        
-        for seq_id in self.layer_block_tables:
-            print(f"seq_id: {seq_id}, layer_block_tables: {self.layer_block_tables[seq_id]}")
+
+        return min_gpu_layers
+        # for seq_id in self.layer_block_tables:
+        #     print(f"seq_id: {seq_id}, layer_block_tables: {self.layer_block_tables[seq_id]}")
             
             
 
@@ -778,16 +800,26 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         This is used by speculative decoding when speculating future tokens.
         """
 
-        num_touched_blocks = 0
+        num_gpu_touched_blocks = 0
+        num_cpu_touched_blocks = 0
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
             for layer_id in range(self.num_layers):
-                block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
-                num_touched_blocks += (
-                block_table.get_num_blocks_touched_by_append_slots(
-                    token_ids=block_table.get_unseen_token_ids(
-                        seq.get_token_ids()),
-                    num_lookahead_slots=num_lookahead_slots,
-                ))
+                if layer_id == 0 or layer_id % 2 == 1:
+                    block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU]
+                    num_gpu_touched_blocks += (
+                    block_table.get_num_blocks_touched_by_append_slots(
+                        token_ids=block_table.get_unseen_token_ids(
+                            seq.get_token_ids()),
+                        num_lookahead_slots=num_lookahead_slots,
+                    ))
+                if layer_id % 2 == 0:
+                    block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
+                    num_cpu_touched_blocks += (
+                    block_table.get_num_blocks_touched_by_append_slots(
+                        token_ids=block_table.get_unseen_token_ids(
+                            seq.get_token_ids()),
+                        num_lookahead_slots=num_lookahead_slots,
+                    ))
             # block_table = self.block_tables[seq.seq_id]
 
             # num_touched_blocks += (
@@ -797,9 +829,9 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
             #         num_lookahead_slots=num_lookahead_slots,
             #     ))
 
-        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(
-            Device.GPU)
-        return num_touched_blocks <= num_free_gpu_blocks
+        num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(Device.GPU)
+        num_free_cpu_blocks = self.block_allocator.get_num_free_blocks(Device.CPU)
+        return num_gpu_touched_blocks <= num_free_gpu_blocks and num_cpu_touched_blocks <= num_free_cpu_blocks
 
     def append_slots(
         self,
@@ -807,14 +839,38 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         num_lookahead_slots: int,
     ) -> List[Tuple[int, int]]:
         for layer_id in range(self.num_layers):
-            block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
-            block_table.append_token_ids(
-                token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
-                num_lookahead_slots=num_lookahead_slots,
-                num_computed_slots=seq.data.get_num_computed_tokens(),
-                extra_hash=seq.extra_hash(),
-            )
-        # block_table = self.block_tables[seq.seq_id]
+            if layer_id == 0 or layer_id % 2 == 1:
+                block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU]
+                block_table.append_token_ids(
+                    token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
+                    num_lookahead_slots=num_lookahead_slots,
+                    num_computed_slots=seq.data.get_num_computed_tokens(),
+                    extra_hash=seq.extra_hash(),
+                )
+            if layer_id % 2 == 0:
+                # 与layer0同步更新GPU上的block table
+                self.layer_block_tables[seq.seq_id][layer_id][Device.GPU] \
+                    = self.layer_block_tables[seq.seq_id][0][Device.GPU]
+                # 在CPU上进行分配
+                assert seq.seq_id in self.layer_block_tables
+                assert layer_id in self.layer_block_tables[seq.seq_id]
+                assert Device.CPU in self.layer_block_tables[seq.seq_id][layer_id]
+                cpu_block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
+                if cpu_block_table is not None:
+                    cpu_block_table.append_token_ids(
+                        token_ids=cpu_block_table.get_unseen_token_ids(seq.get_token_ids()),
+                        num_lookahead_slots=num_lookahead_slots,
+                        num_computed_slots=seq.data.get_num_computed_tokens(),
+                        extra_hash=seq.extra_hash(),
+                    )
+        #     block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
+        #     block_table.append_token_ids(
+        #         token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
+        #         num_lookahead_slots=num_lookahead_slots,
+        #         num_computed_slots=seq.data.get_num_computed_tokens(),
+        #         extra_hash=seq.extra_hash(),
+        #     )
+        # # block_table = self.block_tables[seq.seq_id]
 
         # block_table.append_token_ids(
         #     token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
@@ -840,21 +896,22 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
 
         for layer_id in range(self.num_layers):
             if seq_id in self.layer_block_tables and layer_id in self.layer_block_tables[seq_id]:
-                device, block_table = self.layer_block_tables[seq_id][layer_id]
-                if not block_table:
-                    continue
-                    
-                # 从block集合中移除
-                if device == Device.GPU:
-                    self.layer_gpu_blocks[layer_id].difference_update(
-                        block_table.physical_block_ids)
-                else:
-                    self.layer_cpu_blocks[layer_id].difference_update(
-                        block_table.physical_block_ids)
-                    
-                # 释放block table
-                block_table.free()
-                del self.layer_block_tables[seq_id][layer_id]
+               for device in self.layer_block_tables[seq_id][layer_id]:
+                    block_table = self.layer_block_tables[seq_id][layer_id][device]
+                    if not block_table:
+                        continue
+                        
+                    # 从block集合中移除
+                    if device == Device.GPU:
+                        self.layer_gpu_blocks[layer_id].difference_update(
+                            block_table.physical_block_ids)
+                    else:
+                        self.layer_cpu_blocks[layer_id].difference_update(
+                            block_table.physical_block_ids)
+                        
+                    # 释放block table
+                    block_table.free()
+                    del self.layer_block_tables[seq_id][layer_id][device]
         
         # 如果该层的block table已经被释放，则删除
         del self.layer_block_tables[seq_id]
@@ -871,10 +928,71 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         block_ids = {}
         # 获取每一层的block ids
         for layer_id in range(self.num_layers):
-            block_ids_cur_layer = self.layer_block_tables[seq.seq_id][layer_id][1].physical_block_ids
+            block_ids_cur_layer = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU].physical_block_ids
             block_ids[layer_id] = block_ids_cur_layer
         return block_ids  # type: ignore
 
+    def _get_block_mapping_by_layer(
+        self, seq: Sequence, layer_id: int
+    ) -> List[Tuple[int, int]]:
+        assert seq.seq_id in self.layer_block_tables
+        assert layer_id in self.layer_block_tables[seq.seq_id]
+        assert Device.CPU in self.layer_block_tables[seq.seq_id][layer_id]
+        assert Device.GPU in self.layer_block_tables[seq.seq_id][layer_id]
+
+        gpu_blocks = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU].physical_block_ids
+        cpu_blocks = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU].physical_block_ids
+        assert len(gpu_blocks) == len(cpu_blocks)
+        assert len(gpu_blocks) != 0
+
+        block_mapping = [
+            (gpu_blocks[i], cpu_blocks[i] - self.num_total_gpu_blocks)
+            for i in range(len(gpu_blocks))]
+
+        return block_mapping
+
+    # block mapping :
+    #   layer_id -> (prefetch block mapping, offload block mapping)
+    #   prefetch block mapping: List[(gpu_block_id, cpu_block_id)]
+    #   offload block mapping: List[(gpu_block_id, cpu_block_id)]
+    def get_block_mapping(self, seq: Sequence) -> Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]:
+        is_prefill = seq.is_prefill()
+        block_mapping = {}
+        assert seq.seq_id in self.layer_block_tables
+        
+        for layer_id in range(self.num_layers):
+            if Device.CPU in self.layer_block_tables[seq.seq_id][layer_id]:
+                assert self.layer_block_tables[seq.seq_id][layer_id][Device.CPU] is not None
+                if is_prefill:
+                    # 预填充请求在CPU上不存在cache，不需要预取
+                    # 但是在进行解码计算的时候需要预取第0层的cache
+                    offload_mapping = self._get_block_mapping_by_layer(seq, layer_id)
+                    prefetch_mapping = offload_mapping if layer_id == 0 else []
+
+                else:
+                    # 解码请求在CPU上存在cache，需要预取
+                    prefetch_mapping = self._get_block_mapping_by_layer(seq, layer_id)
+                    # 解码请求只需要卸载最新生成的cache到CPU
+                    offload_mapping = [prefetch_mapping[-1]]
+                    # gpu_block = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU].physical_block_ids[-1]
+                    # cpu_block = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU].physical_block_ids[-1]
+                    # offload_mapping = [(gpu_block, cpu_block - self.num_total_gpu_blocks)]
+
+                block_mapping[layer_id] = (prefetch_mapping, offload_mapping)
+
+        # for layer_id in range(self.num_layers):
+        #     if Device.CPU in self.layer_block_tables[seq.seq_id][layer_id]:
+        #         assert self.layer_block_tables[seq.seq_id][layer_id][Device.CPU] is not None
+        #         gpu_blocks = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU].physical_block_ids
+        #         cpu_blocks = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU].physical_block_ids
+        #         assert len(gpu_blocks) == len(cpu_blocks)
+        #         assert len(gpu_blocks) is not 0
+        #         block_mapping_cur_layer = [
+        #             (gpu_blocks[i], cpu_blocks[i])
+        #             for i in range(len(gpu_blocks))]
+        #         block_mapping[layer_id] = block_mapping_cur_layer
+        return block_mapping
+        
     def get_cross_block_table(self, seq_group: SequenceGroup) -> List[int]:
         request_id = seq_group.request_id
         assert request_id in self.cross_block_tables

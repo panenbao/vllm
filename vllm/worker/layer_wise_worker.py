@@ -1,11 +1,13 @@
 """A GPU worker class."""
 import gc
 import os
+import time
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed
 
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_kv_transfer_initialized,
@@ -463,7 +465,70 @@ class LayerWiseWorker(LocalOrDistributedWorkerBase):
         return LayerWiseCacheEngine.get_cache_block_size(self.cache_config,
                                                 self.model_config,
                                                 self.parallel_config)
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None,
+        block_mapping: Optional[Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]] = None,
+    ) -> Optional[List[SamplerOutput]]:
+        """Executes at least one model step on the given sequences, unless no
+        sequences are provided."""
+        start_time = time.perf_counter()
 
+        inputs = self.prepare_input(execute_model_req)
+        if inputs is None:
+            return None
+
+        model_input, worker_input, kwargs = inputs
+        num_steps = worker_input.num_steps
+
+        self.execute_worker(worker_input)
+
+        # If there is no input, we don't need to execute the model.
+        if worker_input.num_seq_groups == 0:
+            return []
+
+        intermediate_tensors = None
+        orig_model_execute_time = 0.0
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                orig_model_execute_time = intermediate_tensors.tensors.get(
+                    "model_execute_time", torch.tensor(0)).item()
+
+        output = self.model_runner.execute_model(
+            model_input=model_input,
+            kv_caches=self.kv_cache[worker_input.virtual_engine]
+            if self.kv_cache is not None else None,
+            cpu_cache=self.cache_engine[worker_input.virtual_engine].cpu_cache
+            if self.cache_engine is not None else None,
+            block_mapping=block_mapping,
+            intermediate_tensors=intermediate_tensors,
+            num_steps=num_steps,
+            **kwargs,
+        )
+
+        model_execute_time = time.perf_counter() - start_time
+        if not get_pp_group().is_last_rank:
+            # output is IntermediateTensors
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                output.tensors["model_execute_time"] = torch.tensor(
+                    model_execute_time + orig_model_execute_time)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return [None]
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_execute_time
+                and output is not None):
+            for o in output:
+                o.model_execute_time = (orig_model_execute_time +
+                                        model_execute_time)
+
+        # output is List[SamplerOutput]
+        return output
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

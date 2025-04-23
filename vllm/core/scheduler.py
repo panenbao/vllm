@@ -34,6 +34,7 @@ logging.basicConfig(
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
+logging.disable(logging.CRITICAL)
 # logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
@@ -400,11 +401,11 @@ class Scheduler:
                 sliding_window=self.cache_config.sliding_window,
                 enable_caching=self.cache_config.enable_prefix_caching)
         else:
-            if num_gpu_blocks and num_layers:
-                num_gpu_blocks *= num_layers
+            # if num_gpu_blocks and num_layers:
+            #     num_gpu_blocks *= num_layers
 
-            if num_cpu_blocks and num_layers:
-                num_cpu_blocks *= num_layers
+            # if num_cpu_blocks and num_layers:
+            #     num_cpu_blocks *= num_layers
             self.block_manager = LayerWiseSelfAttnBlockSpaceManager(                
                 block_size=self.cache_config.block_size,
                 num_gpu_blocks=num_gpu_blocks,
@@ -485,6 +486,7 @@ class Scheduler:
         # will be stopped during schedule() call and added to this stop list
         # for processing and deallocation by the free_finished_seq_groups()
         self._async_stopped: List[SequenceGroup] = []
+        self.min_gpu_layer = num_layers
 
     @property
     def next_cache_id(self):
@@ -1630,7 +1632,7 @@ class Scheduler:
 
     def schedule(
             self
-    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+    ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool, Dict[int, List[Tuple[int, int]]]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
@@ -1643,7 +1645,8 @@ class Scheduler:
             common_computed_block_nums = []
 
         allow_async_output_proc: bool = self.use_async_output_proc
-
+        # 目前只支持偶数层的block mapping
+        block_mapping: Dict[int, List[Tuple[int, int]]] = {}
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
@@ -1755,6 +1758,13 @@ class Scheduler:
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+            seq_block_mapping = self.block_manager.get_block_mapping(seq_group.get_seqs()[0])
+            assert seq_block_mapping is not None
+            for layer_id in seq_block_mapping:
+                if layer_id not in block_mapping:
+                    block_mapping[layer_id] = []
+                for src_dst in seq_block_mapping[layer_id]:
+                    block_mapping[layer_id].append(src_dst)
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1783,9 +1793,10 @@ class Scheduler:
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
-                allow_async_output_proc)
+                allow_async_output_proc, block_mapping)
 
-    def schdule_layerwise(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:
+    def schdule_layerwise(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool,
+                                         Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
@@ -1798,7 +1809,8 @@ class Scheduler:
             common_computed_block_nums = []
 
         allow_async_output_proc: bool = self.use_async_output_proc
-
+        # 目前只支持偶数层的block mapping
+        block_mapping: Dict[int, List[Tuple[int, int]]] = {}
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
@@ -1910,6 +1922,13 @@ class Scheduler:
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+            seq_block_mapping = self.block_manager.get_block_mapping(seq_group.get_seqs()[0])
+            assert seq_block_mapping is not None
+            for layer_id in seq_block_mapping:
+                if layer_id not in block_mapping:
+                    block_mapping[layer_id] = ([], [])
+                for i in range(2):
+                    block_mapping[layer_id][i].extend(seq_block_mapping[layer_id][i])
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1938,7 +1957,7 @@ class Scheduler:
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,
-                allow_async_output_proc)
+                allow_async_output_proc, block_mapping)
     
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)
@@ -1988,7 +2007,7 @@ class Scheduler:
             self._async_stopped.clear()
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
-        self.block_manager.allocate(seq_group)
+        min_gpu_layer = self.block_manager.allocate(seq_group)
         for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
             seq.status = SequenceStatus.RUNNING
 

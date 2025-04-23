@@ -893,7 +893,8 @@ class CacheConfig:
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.swap_space_bytes = swap_space * GiB_bytes
+        # self.swap_space_bytes = swap_space * GiB_bytes
+        self.swap_space_bytes =70 * GiB_bytes
         self.num_gpu_blocks_override = num_gpu_blocks_override
         self.cache_dtype = cache_dtype
         self.is_attention_free = is_attention_free

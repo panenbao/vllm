@@ -1186,6 +1186,24 @@ class LayerWiseModelRunner(ModelRunner):
         LayerWiseModelInputForGPUWithSamplingMetadata)
     _builder_cls: Type[LayerWiseModelInputForGPUBuilder] = LayerWiseModelInputForGPUBuilder
     
+    # def __init__(
+    #     self,
+    #     vllm_config: VllmConfig,
+    #     kv_cache_dtype: Optional[str] = "auto",
+    #     is_driver_worker: bool = False,
+    #     return_hidden_states: bool = False,
+    #     input_registry: InputRegistry = INPUT_REGISTRY,
+    #     mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+    # ):
+    #     super().__init__(
+    #         vllm_config,
+    #         kv_cache_dtype=kv_cache_dtype,
+    #         is_driver_worker=is_driver_worker,
+    #         return_hidden_states=return_hidden_states,
+    #         input_registry=input_registry,
+    #         mm_registry=mm_registry,
+    #     )
+        
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -1332,7 +1350,8 @@ class LayerWiseModelRunner(ModelRunner):
                     graph_runner = LayerWiseCUDAGraphRunner(
                         self.model, self.attn_backend.get_name(),
                         self.attn_state.graph_clone(batch_size),
-                        self.model_config.is_encoder_decoder)
+                        self.model_config.is_encoder_decoder,
+                        self.model_config.get_num_layers(self.parallel_config),)
 
                     capture_inputs = {
                         "input_ids":
@@ -1389,6 +1408,8 @@ class LayerWiseModelRunner(ModelRunner):
         self,
         model_input: LayerWiseModelInputForGPUWithSamplingMetadata,
         kv_caches: torch.Tensor,
+        cpu_cache: torch.Tensor,
+        block_mapping: Optional[Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         num_steps: int = 1,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
@@ -1456,6 +1477,10 @@ class LayerWiseModelRunner(ModelRunner):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
+        block_mapping_tensor: Dict[int, Tuple[torch.tensor, torch.tensor]] = {}
+        for layer_id in block_mapping:
+            block_mapping_tensor[layer_id] = (torch.tensor(block_mapping[layer_id][0], dtype=torch.long, device='cpu'),
+                                              torch.tensor(block_mapping[layer_id][1], dtype=torch.long, device='cpu'))
         if not bypass_model_exec:
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config):
@@ -1463,6 +1488,8 @@ class LayerWiseModelRunner(ModelRunner):
                     input_ids=model_input.input_tokens,
                     positions=model_input.input_positions,
                     kv_caches=kv_caches,
+                    cpu_cache=cpu_cache,
+                    block_mapping=block_mapping_tensor,
                     attn_metadata=model_input.attn_metadata,
                     intermediate_tensors=intermediate_tensors,
                     **MultiModalKwargs.as_kwargs(multi_modal_kwargs,
@@ -1662,7 +1689,8 @@ class LayerWiseModelRunner(ModelRunner):
 class LayerWiseCUDAGraphRunner(nn.Module):
 
     def __init__(self, model: nn.Module, backend_name: str,
-                 attn_state: AttentionState, is_encoder_decoder_model: bool):
+                 attn_state: AttentionState, is_encoder_decoder_model: bool,
+                 num_layers: int):
         super().__init__()
         self.model = model
         self.backend_name = backend_name
@@ -1673,6 +1701,8 @@ class LayerWiseCUDAGraphRunner(nn.Module):
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._is_encoder_decoder_model = is_encoder_decoder_model
+        
+        self.num_layers = num_layers
 
     @property
     def graph(self):
@@ -1685,6 +1715,8 @@ class LayerWiseCUDAGraphRunner(nn.Module):
         positions: torch.Tensor,
         intermediate_inputs: Optional[IntermediateTensors],
         kv_caches: torch.Tensor,
+        cpu_cache: torch.Tensor,
+        block_mapping: Dict[int, Tuple[torch.tensor, torch.tensor]],
         attn_metadata: AttentionMetadata,
         memory_pool: Optional[Tuple[int, int]],
         stream: torch.cuda.Stream,
@@ -1700,7 +1732,9 @@ class LayerWiseCUDAGraphRunner(nn.Module):
                 input_ids=input_ids,
                 positions=positions,
                 kv_caches=kv_caches,
-                attn_metadata=attn_metadata,
+                cpu_cache=cpu_cache,
+                block_mapping=block_mapping,
+                attn_metadata=[attn_metadata for _ in range(self.num_layers)],
                 intermediate_tensors=intermediate_inputs,
                 **kwargs,
             )

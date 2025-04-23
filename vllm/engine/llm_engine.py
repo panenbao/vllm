@@ -1425,14 +1425,17 @@ class LLMEngine:
         # batch has completed.
         if not self._has_remaining_steps(seq_group_metadata_list):
             # Schedule iteration
+            schedule_start_time = time.time()
             if self.scheduler_config.enable_slo_scheduler:
                 (seq_group_metadata_list, scheduler_outputs,
-                 allow_async_output_proc) = self.scheduler[virtual_engine].schdule_layerwise()
+                 allow_async_output_proc, block_mapping) = self.scheduler[virtual_engine].schdule_layerwise()
+                
             else:
                 (seq_group_metadata_list, scheduler_outputs,
                 allow_async_output_proc
                 ) = self.scheduler[virtual_engine].schedule()
-
+            schedule_end_time = time.time()
+            schedule_time = schedule_end_time - schedule_start_time
             ctx.seq_group_metadata_list = seq_group_metadata_list
             ctx.scheduler_outputs = scheduler_outputs
 
@@ -1481,9 +1484,14 @@ class LLMEngine:
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
 
+            model_execution_start_time = time.time()
             outputs = self.model_executor.execute_model(
-                execute_model_req=execute_model_req)
-
+                execute_model_req=execute_model_req, block_mapping=block_mapping)
+            model_execution_end_time = time.time()
+            model_execution_time = model_execution_end_time - \
+                model_execution_start_time
+            with open('/home/panenbao/vllm/logs/schedule_and_execute_time.log', 'a') as f:
+                f.write(f"Time 1: {schedule_time}, Time 2: {model_execution_time}\n")
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
             if self.scheduler_config.is_multi_step:
