@@ -803,31 +803,36 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         num_gpu_touched_blocks = 0
         num_cpu_touched_blocks = 0
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            for layer_id in range(self.num_layers):
-                if layer_id == 0 or layer_id % 2 == 1:
-                    block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU]
-                    num_gpu_touched_blocks += (
-                    block_table.get_num_blocks_touched_by_append_slots(
-                        token_ids=block_table.get_unseen_token_ids(
-                            seq.get_token_ids()),
-                        num_lookahead_slots=num_lookahead_slots,
-                    ))
-                if layer_id % 2 == 0:
-                    block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
-                    num_cpu_touched_blocks += (
-                    block_table.get_num_blocks_touched_by_append_slots(
-                        token_ids=block_table.get_unseen_token_ids(
-                            seq.get_token_ids()),
-                        num_lookahead_slots=num_lookahead_slots,
-                    ))
-            # block_table = self.block_tables[seq.seq_id]
-
-            # num_touched_blocks += (
-            #     block_table.get_num_blocks_touched_by_append_slots(
-            #         token_ids=block_table.get_unseen_token_ids(
-            #             seq.get_token_ids()),
-            #         num_lookahead_slots=num_lookahead_slots,
-            #     ))
+            # 偶数层只考虑第0层，其它层复用第0层的block table
+            # 奇数层只考虑GPU
+            # 对于GPU上的touched clocks为(self.num_layers / 2 + 1) * num_blocks_per_layer
+            # 对于CPU上的touched clocks为(self.num_layers / 2) * num_blocks_per_layer
+            block_table = self.layer_block_tables[seq.seq_id][0][Device.GPU]
+            num_touched_blocks_per_layer = (
+            block_table.get_num_blocks_touched_by_append_slots(
+                token_ids=block_table.get_unseen_token_ids(
+                    seq.get_token_ids()),
+                num_lookahead_slots=num_lookahead_slots,
+            ))
+            num_gpu_touched_blocks += num_touched_blocks_per_layer * (self.num_layers // 2 + 1)
+            num_cpu_touched_blocks += num_touched_blocks_per_layer * (self.num_layers // 2)
+            # for layer_id in range(self.num_layers):
+            #     if layer_id == 0 or layer_id % 2 == 1:
+            #         block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU]
+            #         num_gpu_touched_blocks += (
+            #         block_table.get_num_blocks_touched_by_append_slots(
+            #             token_ids=block_table.get_unseen_token_ids(
+            #                 seq.get_token_ids()),
+            #             num_lookahead_slots=num_lookahead_slots,
+            #         ))
+            #     if layer_id % 2 == 0:
+            #         block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
+            #         num_cpu_touched_blocks += (
+            #         block_table.get_num_blocks_touched_by_append_slots(
+            #             token_ids=block_table.get_unseen_token_ids(
+            #                 seq.get_token_ids()),
+            #             num_lookahead_slots=num_lookahead_slots,
+            #         ))
 
         num_free_gpu_blocks = self.block_allocator.get_num_free_blocks(Device.GPU)
         num_free_cpu_blocks = self.block_allocator.get_num_free_blocks(Device.CPU)
@@ -838,47 +843,37 @@ class LayerWiseSelfAttnBlockSpaceManager(SelfAttnBlockSpaceManager):
         seq: Sequence,
         num_lookahead_slots: int,
     ) -> List[Tuple[int, int]]:
+        token_ids=self.layer_block_tables[seq.seq_id][0][Device.GPU].get_unseen_token_ids(seq.get_token_ids())
+        num_lookahead_slots=num_lookahead_slots
+        num_computed_slots=seq.data.get_num_computed_tokens()
+        extra_hash=seq.extra_hash()
         for layer_id in range(self.num_layers):
             if layer_id == 0 or layer_id % 2 == 1:
                 block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.GPU]
                 block_table.append_token_ids(
-                    token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
+                    token_ids=token_ids,
                     num_lookahead_slots=num_lookahead_slots,
-                    num_computed_slots=seq.data.get_num_computed_tokens(),
-                    extra_hash=seq.extra_hash(),
+                    num_computed_slots=num_computed_slots,
+                    extra_hash=extra_hash,
                 )
             if layer_id % 2 == 0:
                 # 与layer0同步更新GPU上的block table
                 self.layer_block_tables[seq.seq_id][layer_id][Device.GPU] \
                     = self.layer_block_tables[seq.seq_id][0][Device.GPU]
                 # 在CPU上进行分配
-                assert seq.seq_id in self.layer_block_tables
-                assert layer_id in self.layer_block_tables[seq.seq_id]
-                assert Device.CPU in self.layer_block_tables[seq.seq_id][layer_id]
-                cpu_block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
-                if cpu_block_table is not None:
-                    cpu_block_table.append_token_ids(
-                        token_ids=cpu_block_table.get_unseen_token_ids(seq.get_token_ids()),
-                        num_lookahead_slots=num_lookahead_slots,
-                        num_computed_slots=seq.data.get_num_computed_tokens(),
-                        extra_hash=seq.extra_hash(),
-                    )
-        #     block_table = self.layer_block_tables[seq.seq_id][layer_id][1]
-        #     block_table.append_token_ids(
-        #         token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
-        #         num_lookahead_slots=num_lookahead_slots,
-        #         num_computed_slots=seq.data.get_num_computed_tokens(),
-        #         extra_hash=seq.extra_hash(),
-        #     )
-        # # block_table = self.block_tables[seq.seq_id]
-
-        # block_table.append_token_ids(
-        #     token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
-        #     num_lookahead_slots=num_lookahead_slots,
-        #     num_computed_slots=seq.data.get_num_computed_tokens(),
-        #     extra_hash=seq.extra_hash(),
-        # )
-        # Return any new copy-on-writes.
+                block_table = self.layer_block_tables[seq.seq_id][layer_id][Device.CPU]
+                block_table.append_token_ids(
+                    token_ids=token_ids,
+                    num_lookahead_slots=num_lookahead_slots,
+                    num_computed_slots=num_computed_slots,
+                    extra_hash=extra_hash,
+                )
+            # block_table.append_token_ids(
+            #     token_ids=token_ids,
+            #     num_lookahead_slots=num_lookahead_slots,
+            #     num_computed_slots=num_computed_slots,
+            #     extra_hash=extra_hash,
+            # )
         new_cows = self.block_allocator.clear_copy_on_writes()
         return new_cows
 

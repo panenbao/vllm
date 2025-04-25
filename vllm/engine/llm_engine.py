@@ -1428,7 +1428,7 @@ class LLMEngine:
             schedule_start_time = time.time()
             if self.scheduler_config.enable_slo_scheduler:
                 (seq_group_metadata_list, scheduler_outputs,
-                 allow_async_output_proc, block_mapping) = self.scheduler[virtual_engine].schdule_layerwise()
+                 allow_async_output_proc, block_mapping) = self.scheduler[virtual_engine].schedule_layerwise()
                 
             else:
                 (seq_group_metadata_list, scheduler_outputs,

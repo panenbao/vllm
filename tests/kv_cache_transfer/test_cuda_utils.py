@@ -36,7 +36,7 @@ def test_transfer_tensor(dtype):
     block_mapping = [[1,1],[1,2]]
     block_mapping = torch.tensor(block_mapping, device="cpu")
     transfer_manager = KVCacheTransferManager()
-    transfer_manager.copy(gpu_tensor, cpu_tensor, block_mapping)
+    transfer_manager.offload(gpu_tensor, cpu_tensor, block_mapping)
     transfer_manager.wait_transfer()
     
 

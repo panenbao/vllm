@@ -1,111 +1,75 @@
 import time
 import torch
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 class KVCacheTransferManager:
     """管理 KV Cache 在 GPU 和 CPU 之间的异步传输"""
 
     def __init__(self) -> None:
-        self.copy_stream = torch.cuda.Stream()
-        self.prefetch_stream = torch.cuda.Stream()
-        self.copy_event = torch.cuda.Event()
-        self.is_transferring: bool = False
+        self.streams: List[List[torch.cuda.Stream]]
+        self.events: List[List[torch.cuda.Event]]
 
-    def copy(self, src: torch.Tensor, dst: torch.Tensor, block_mapping: torch.Tensor) -> None:
-        """交换 GPU 和 CPU 之间的 KV cache"""
-        if block_mapping is None:
+    def offload(self, gpu_cache: torch.Tensor, cpu_cache: torch.Tensor, block_mapping: torch.Tensor) -> None:
+        """GPU -> CPU"""
+        if block_mapping is None or block_mapping.size()[0] == 0:
             return
-        if self.is_transferring:
-            self.copy_stream.synchronize()
-            self.is_transferring = False
+        num_blocks = block_mapping.size()[0]
+        with open('/home/panenbao/vllm/logs/offload_len.log', 'a') as f:
+            f.write(f'{num_blocks}\n')
+        self.streams = [[torch.cuda.Stream() for _ in range(2)] for _ in range(num_blocks)]
+        self.events = [[torch.cuda.Event() for _ in range(2)] for _ in range(num_blocks)]
+        for i in range(num_blocks):
+            gpu_block_number = block_mapping[i][0]
+            cpu_block_number = block_mapping[i][1]
 
-        # 启动异步传输
-        with torch.cuda.stream(self.copy_stream):
-            self.is_transferring = True
-            num_blocks = block_mapping.size()[0]
-            for i in range(num_blocks):
-                src_block_number = block_mapping[i][0]
-                dst_block_number = block_mapping[i][1]
-                src_block_k = src[0][src_block_number]
-                dst_block_k = dst[0][dst_block_number]
-                dst_block_k.copy_(src_block_k, non_blocking=True)
-                src_block_v = src[1][src_block_number]
-                dst_block_v = dst[1][dst_block_number]
-                dst_block_v.copy_(src_block_v, non_blocking=True)
-            self.copy_event.record(self.copy_stream)
+            gpu_block_k = gpu_cache[0][gpu_block_number]
+            cpu_block_k = cpu_cache[0][cpu_block_number]
+            gpu_block_v = gpu_cache[1][gpu_block_number]
+            cpu_block_v = cpu_cache[1][cpu_block_number]
 
-    def prefetch(self, src: torch.Tensor, dst: torch.Tensor, block_mapping: torch.Tensor) -> None:
-        """预取 KV cache"""
-        # 启动异步传输
-        with torch.cuda.stream(self.prefetch_stream):
-            self.is_transferring = True
-            num_blocks = block_mapping.size()[0]
-            for i in range(num_blocks):
-                src_block_number = block_mapping[i][1]
-                dst_block_number = block_mapping[i][0]
-                src_block_k = src[0][src_block_number]
-                dst_block_k = dst[0][dst_block_number]
-                dst_block_k.copy_(src_block_k, non_blocking=True)
-                src_block_v = src[1][src_block_number]
-                dst_block_v = dst[1][dst_block_number]
-                dst_block_v.copy_(src_block_v, non_blocking=True)
-            self.is_transferring = False
-
-    def transfer_state(self) -> bool:
-        """非阻塞地检查传输状态"""
-        if not self.is_transferring:
-            return False
+            with torch.cuda.stream(self.streams[i][0]):
+                cpu_block_k.copy_(gpu_block_k, non_blocking=True)
+                self.events[i][0].record(self.streams[i][0])
             
-        if self.copy_event.query():
-            self.is_transferring = False
-            return True
-        return False
+            with torch.cuda.stream(self.streams[i][1]):
+                cpu_block_v.copy_(gpu_block_v, non_blocking=True)
 
-    def wait_transfer(self):
-        """阻塞等待传输完成"""
-        if not self.is_transferring:
+    def prefetch(self, cpu_cache: torch.Tensor, gpu_cache: torch.Tensor, block_mapping: torch.Tensor,
+                 events: List[List[torch.cuda.Event]]) -> None:
+        """CPU -> GPU"""
+        if block_mapping is None or block_mapping.size()[0] == 0:
             return
-        
-        self.copy_stream.synchronize()
-        self.is_transferring = False
-        
-    def wait_fetch(self):
-        """阻塞等待预取完成"""
-        # start_time = time.time()
-        # start_event = torch.cuda.Event(enable_timing=True)
-        # end_event = torch.cuda.Event(enable_timing=True)
-        # start_event.record()
-        self.prefetch_stream.synchronize()
-        # end_time = time.time()
-        # print(f'wait_time:{end_time - start_time} s')
-        # end_event.record()
-        # start_event.synchronize()
-        # end_event.synchronize()
-        # time = start_event.elapsed_time(end_event)
-        # print (f"wait time: {time} ms")
 
-    def offload_cur_and_prefetch_next(
-        self,
-        src: torch.Tensor,
-        dst: torch.Tensor,
-        block_mapping: Tuple[torch.Tensor, torch.Tensor],
-    ) -> None:
-        """卸载当前 KV cache 和预取下一个 KV cache"""
-        self.copy(src, dst, block_mapping[0])
-        """预取 KV cache"""
-        with torch.cuda.stream(self.prefetch_stream):
-            self.copy_event.wait()
-            self.is_transferring = True
-            num_blocks = block_mapping[1].size()[0]
-            for i in range(num_blocks):
-                src_block_number = block_mapping[1][i][0]
-                dst_block_number = block_mapping[1][i][1]
-                src_block_k = src[0][src_block_number]
-                dst_block_k = dst[0][dst_block_number]
-                dst_block_k.copy_(src_block_k, non_blocking=True)
-                src_block_v = src[1][src_block_number]
-                dst_block_v = dst[1][dst_block_number]
-                dst_block_v.copy_(src_block_v, non_blocking=True)
-            self.copy_event = torch.cuda.Event()
+        event_len = len(events) if events else 0
+        num_blocks = block_mapping.size()[0]
+        min_wait_event = min(event_len, num_blocks)
+        with open('/home/panenbao/vllm/logs/prefetch_len.log', 'a') as f:
+            f.write(f'{num_blocks}\n')
+        self.streams = [[torch.cuda.Stream() for _ in range(2)] for _ in range(num_blocks)]
+        self.events = [[torch.cuda.Event() for _ in range(2)] for _ in range(num_blocks)]
+        for i in range(num_blocks):
+            gpu_block_number = block_mapping[i][0]
+            cpu_block_number = block_mapping[i][1]
+
+            gpu_block_k = gpu_cache[0][gpu_block_number]
+            cpu_block_k = cpu_cache[0][cpu_block_number]
+            gpu_block_v = gpu_cache[1][gpu_block_number]
+            cpu_block_v = cpu_cache[1][cpu_block_number]
+
+            with torch.cuda.stream(self.streams[i][0]):
+                # if i < min_wait_event:
+                #     events[i][0].wait(self.streams[i][0])
+                gpu_block_k.copy_(cpu_block_k, non_blocking=True)
+                self.events[i][0].record(self.streams[i][0])
+
+            with torch.cuda.stream(self.streams[i][1]):
+                # if i < min_wait_event:
+                #     events[i][1].wait(self.streams[i][1])
+                gpu_block_v.copy_(cpu_block_v, non_blocking=True)
+                self.events[i][1].record(self.streams[i][1])
+                
+    def get_events(self) -> List[List[torch.cuda.Event]]:
+        """获取事件列表"""
+        return self.events

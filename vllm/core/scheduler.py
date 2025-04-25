@@ -33,8 +33,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logging.disable(logging.CRITICAL)
+logger.setLevel(logging.INFO)
+# logging.disable(logging.CRITICAL)
 # logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
@@ -605,6 +605,7 @@ class Scheduler:
         Returns:
             SchedulerRunningOutputs.
         """
+        times = []
         ret: SchedulerRunningOutputs = \
             self._scheduler_running_outputs_cache[self.cache_id].get_object()
         ret.blocks_to_swap_out.clear()
@@ -614,8 +615,11 @@ class Scheduler:
         ret.preempted.clear()
         ret.swapped_out.clear()
 
+        _get_num_lookahead_slots_start = time.perf_counter()
         ret.num_lookahead_slots = self._get_num_lookahead_slots(
             is_prefill=False, enable_chunking=enable_chunking)
+        _get_num_lookahead_slots_time = time.perf_counter() - _get_num_lookahead_slots_start
+        times.append(_get_num_lookahead_slots_time)
 
         ret.decode_seq_groups_list.clear()
         ret.prefill_seq_groups_list.clear()
@@ -632,6 +636,9 @@ class Scheduler:
 
         running_queue = self.running
         assert len(self._async_stopped) == 0
+        _get_num_new_uncached_and_cached_tokens_time = 0.0
+        _append_slots_time = 0.0
+        while_time = 0.0
         while running_queue:
             seq_group = running_queue[0]
             # We discard the cached tokens info here because we don't need it
@@ -641,10 +648,14 @@ class Scheduler:
             #   2. If a sequence is running with non-chunked prefill, then
             #      there it's a decoding sequence, and the cached tokens info is
             #      irrelevant.
+            _get_num_new_uncached_and_cached_tokens_start = time.perf_counter()
             num_uncached_new_tokens, _ = (
                 self._get_num_new_uncached_and_cached_tokens(
                     seq_group, SequenceStatus.RUNNING, enable_chunking,
                     budget))
+            cur_get_num_new_uncached_and_cached_tokens_time = time.perf_counter() - \
+                _get_num_new_uncached_and_cached_tokens_start
+            _get_num_new_uncached_and_cached_tokens_time += cur_get_num_new_uncached_and_cached_tokens_time
 
             num_running_tokens = num_uncached_new_tokens
             if num_running_tokens == 0:
@@ -662,6 +673,8 @@ class Scheduler:
                 self._async_stopped.append(seq_group)
                 continue
 
+            cur_while_time = float('inf')
+            _append_slots_start = time.perf_counter()
             # NOTE(woosuk): Preemption happens only when there is no available
             # slot to keep all the sequence groups in the RUNNING state.
             while not self._can_append_slots(seq_group, enable_chunking):
@@ -714,6 +727,8 @@ class Scheduler:
                 if not cont_loop:
                     break
             else:
+                cur_while_time = time.perf_counter() - _append_slots_start
+                
                 self._append_slots(seq_group, blocks_to_copy, enable_chunking)
                 is_prefill = seq_group.is_prefill()
 
@@ -741,6 +756,15 @@ class Scheduler:
                 if curr_loras is not None and seq_group.lora_int_id > 0:
                     curr_loras.add(seq_group.lora_int_id)
 
+            cur_append_slots_time = time.perf_counter() - _append_slots_start
+            _append_slots_time += cur_append_slots_time
+            if cur_while_time != float('inf'):
+                while_time += cur_while_time
+        times.append(_get_num_new_uncached_and_cached_tokens_time)
+        times.append(_append_slots_time)
+        times.append(while_time if while_time != float('inf') else _append_slots_time)
+        with open('/home/panenbao/vllm/logs/times_in_schedule_running.log', 'a') as f:
+            f.write(','.join(map(str, times)) + '\n')
         self._scheduler_running_outputs_cache[self.next_cache_id].reset()
         self._scheduled_seq_group_cache[self.next_cache_id].reset()
 
@@ -1068,12 +1092,12 @@ class Scheduler:
             ):
                 break
 
-            if self.scheduler_config.enable_slo_scheduler:
-                prefill_time = seq_group.get_seqs()[0].estimate_prefill_time
-                if not budget.allow_prefill(prefill_time):
-                    break
-                else:
-                    budget.subtrct_time_allow_prefill(prefill_time)
+            # if self.scheduler_config.enable_slo_scheduler:
+            #     prefill_time = seq_group.get_seqs()[0].estimate_prefill_time
+            #     if not budget.allow_prefill(prefill_time):
+            #         break
+            #     else:
+            #         budget.subtrct_time_allow_prefill(prefill_time)
 
             # Can schedule this request.
             if curr_loras is not None and lora_int_id > 0:
@@ -1458,11 +1482,13 @@ class Scheduler:
             # Initialize with infinity since we'll update with min Ti_allow_prefill
             time_allow_prefill=float('inf') 
         )
+        times:List[float] = []
         self.step += 1
         logger.debug("schedule step: %d", self.step)
         logger.info("running: %s\n, swapped: %s\n, waiting: %s", self.running, self.swapped, self.waiting)
         
         # 实现状态转移方程，主动预测GPU KV块的状态
+        state_transfer_function_start = time.perf_counter()
         self.num_available_blocks = self.block_manager.get_num_free_gpu_blocks()
         self.num_released_blocks = 0
         self.num_allocated_blocks = 0
@@ -1517,7 +1543,8 @@ class Scheduler:
                      self.num_available_blocks, self.num_allocated_blocks, self.num_released_blocks)
         self.num_available_blocks = self.num_available_blocks + self.num_released_blocks - self.num_allocated_blocks
         logger.debug("num_available_blocks after state transition: %d", self.num_available_blocks)
-        
+        state_transfer_function_time = time.perf_counter() - state_transfer_function_start
+        times.append(state_transfer_function_time)
         # Track currently loaded LoRA adapters
         curr_loras = set(
             seq_group.lora_int_id for seq_group in self.running
@@ -1528,18 +1555,28 @@ class Scheduler:
         running_scheduled = SchedulerRunningOutputs.create_empty() 
         swapped_in = SchedulerSwappedInOutputs.create_empty()
 
+        _schedule_running_start = time.perf_counter()
         # First schedule decoding requests
         running_scheduled = self._schedule_running(
             budget, curr_loras, enable_chunking=False)
+        _schedule_running_time = time.perf_counter() - _schedule_running_start
+        times.append(_schedule_running_time)
 
+        _schedule_swapped_start = time.perf_counter()
         # Then try to schedule swapped requests if no preemption occurred
         if len(running_scheduled.preempted) + len(running_scheduled.swapped_out) == 0:
             swapped_in = self._schedule_swapped(budget, curr_loras)
+        _schedule_swapped_time = time.perf_counter() - _schedule_swapped_start
+        times.append(_schedule_swapped_time)
 
+        _schedule_prefills_start = time.perf_counter()
         # Finally schedule new prefill requests if budget allows
         # prefills = self._schedule_prefills_with_slo(budget, curr_loras)
         prefills = self._schedule_prefills(budget, curr_loras, enable_chunking=False)
+        _schedule_prefills_time = time.perf_counter() - _schedule_prefills_start
+        times.append(_schedule_prefills_time)
 
+        extendleft_start = time.perf_counter()
         # Update scheduler state
         self.waiting.extendleft(running_scheduled.preempted)
         
@@ -1552,6 +1589,8 @@ class Scheduler:
 
         # Update swapped queue
         self.swapped.extend(running_scheduled.swapped_out)
+        extendleft_time = time.perf_counter() - extendleft_start
+        times.append(extendleft_time)
 
         logger.info("running: %s\n, swapped: %s\n, waiting: %s", self.running, self.swapped, self.waiting)
         
@@ -1573,6 +1612,8 @@ class Scheduler:
                                (all_prefills
                                 and not self.scheduler_config.is_multi_step)
                                else running_scheduled.num_lookahead_slots)
+        with open('/home/panenbao/vllm/logs/_schedule_slo_aware_times.log', 'a') as f:
+                f.write(','.join(map(str, times)) + '\n')
         return SchedulerOutputs(
             scheduled_seq_groups=scheduled_seq_groups,
             num_prefill_groups=num_prefill_groups,
@@ -1795,14 +1836,18 @@ class Scheduler:
         return (seq_group_metadata_list, scheduler_outputs,
                 allow_async_output_proc, block_mapping)
 
-    def schdule_layerwise(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool,
+    def schedule_layerwise(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool,
                                          Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
 
+        # Schedule sequence groups
+        schedule_start = time.perf_counter()
         scheduler_outputs: SchedulerOutputs = self._schedule()
+        schedule_time = time.perf_counter() - schedule_start
+
         now = time.time()
 
         if not self.cache_config.enable_prefix_caching:
@@ -1812,6 +1857,7 @@ class Scheduler:
         # 目前只支持偶数层的block mapping
         block_mapping: Dict[int, List[Tuple[int, int]]] = {}
         # Create input data structures.
+        seq_group_creation_start = time.perf_counter()
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
                 scheduler_outputs.scheduled_seq_groups):
@@ -1831,6 +1877,7 @@ class Scheduler:
 
             if seq_group.is_encoder_decoder():
                 # Encoder associated with SequenceGroup
+                encoder_seq_start = time.perf_counter()
                 encoder_seq = seq_group.get_encoder_seq()
                 assert encoder_seq is not None
                 encoder_seq_data = encoder_seq.data
@@ -1838,26 +1885,33 @@ class Scheduler:
                 # Also managed at SequenceGroup level
                 cross_block_table = self.block_manager.get_cross_block_table(
                     seq_group)
+                encoder_seq_time = time.perf_counter() - encoder_seq_start
             else:
                 encoder_seq_data = None
                 cross_block_table = None
 
+            seq_data_collection_start = time.perf_counter()
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
+            seq_data_collection_time = time.perf_counter() - seq_data_collection_start
 
             if self.cache_config.enable_prefix_caching:
+                prefix_cache_start = time.perf_counter()
                 common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
                         seq_group.get_seqs(status=SequenceStatus.RUNNING)))
+                prefix_cache_time = time.perf_counter() - prefix_cache_start
 
             do_sample = True
             is_prompt = seq_group.is_prefill()
             # We should send the metadata to workers when the first prefill
             # is sent. Subsequent requests could be chunked prefill or decode.
             is_first_prefill = False
+
+            prompt_processing_start = time.perf_counter()
             if is_prompt:
                 seqs = seq_group.get_seqs()
                 # Prefill has only 1 sequence.
@@ -1872,9 +1926,11 @@ class Scheduler:
                 if (token_chunk_size + num_computed_tokens <
                         seqs[0].data.get_len()):
                     do_sample = False
+            prompt_processing_time = time.perf_counter() - prompt_processing_start
 
             # It assumes the scheduled_seq_groups is ordered by
             # prefill < decoding.
+            metadata_creation_start = time.perf_counter()
             if is_first_prefill or not self.scheduler_config.send_delta_data:
                 seq_group_metadata = SequenceGroupMetadata(
                     request_id=seq_group.request_id,
@@ -1917,11 +1973,17 @@ class Scheduler:
                     token_chunk_size=token_chunk_size,
                     computed_block_nums=common_computed_block_nums,
                 )
+            metadata_creation_time = time.perf_counter() - metadata_creation_start
+           
             seq_group_metadata_list.append(seq_group_metadata)
 
+            async_check_start = time.perf_counter()
             if allow_async_output_proc:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
+            async_check_time = time.perf_counter() - async_check_start
+
+            block_mapping_start = time.perf_counter()
             seq_block_mapping = self.block_manager.get_block_mapping(seq_group.get_seqs()[0])
             assert seq_block_mapping is not None
             for layer_id in seq_block_mapping:
@@ -1929,19 +1991,29 @@ class Scheduler:
                     block_mapping[layer_id] = ([], [])
                 for i in range(2):
                     block_mapping[layer_id][i].extend(seq_block_mapping[layer_id][i])
+            block_mapping_time = time.perf_counter() - block_mapping_start
+
+        seq_group_creation_time = time.perf_counter() - seq_group_creation_start
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
         # This is because the engine assumes that a failure in model execution
         # will crash the vLLM instance / will not retry.
+        block_marking_start = time.perf_counter()
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             self.block_manager.mark_blocks_as_computed(
                 scheduled_seq_group.seq_group,
                 scheduled_seq_group.token_chunk_size)
+        block_marking_time = time.perf_counter() - block_marking_start
 
+        cache_reset_start = time.perf_counter()
         self._seq_group_metadata_cache[self.next_cache_id].reset()
+        cache_reset_time = time.perf_counter() - cache_reset_start
 
         scheduler_time = time.perf_counter() - scheduler_start_time
+
+        # Add metrics
+        metrics_update_start = time.perf_counter()
         # Add this to scheduler time to all the sequences that are currently
         # running. This will help estimate if the scheduler is a significant
         # component in the e2e latency.
@@ -1951,9 +2023,20 @@ class Scheduler:
                     seq_group.metrics.scheduler_time += scheduler_time
                 else:
                     seq_group.metrics.scheduler_time = scheduler_time
+        metrics_update_time = time.perf_counter() - metrics_update_start
 
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
+        # 记录函数执行时间
+        # 主要延迟来自 schedule time和seq_group_creation_time
+        function_times = [schedule_time, seq_data_collection_time,
+                          prompt_processing_time,
+                          metadata_creation_time, async_check_time,
+                          block_mapping_time, seq_group_creation_time,
+                          block_marking_time, cache_reset_time,
+                          metrics_update_time]
+        with open('/home/panenbao/vllm/logs/function_times_in_schedule.log', 'a') as f:
+                f.write(','.join(map(str, function_times)) + '\n')
 
         # Return results
         return (seq_group_metadata_list, scheduler_outputs,

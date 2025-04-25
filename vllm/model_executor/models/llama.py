@@ -211,12 +211,13 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        # if is_transfer_layer and self.layer_idx % 2 == 0:
-        #     self.transfer_manager.wait_fetch()
+        # torch.cuda.synchronize()
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         if is_transfer_layer and self.layer_idx % 2 == 0:
             # Transfer the KV cache to the CPU
-            self.transfer_manager.copy(kv_cache, cpu_cache, block_mapping)
+            self.transfer_manager.offload(gpu_cache=kv_cache,
+                                          cpu_cache=cpu_cache,
+                                          block_mapping=block_mapping)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -390,21 +391,13 @@ class LlamaModel(nn.Module):
                                             is_transfer_layer=is_transfer_layer)
             if i % 2 == 0:
                 prefetch_layer_id = (i + 2) % self.end_layer
-                with torch.cuda.stream(self.layers[prefetch_layer_id].self_attn.transfer_manager.prefetch_stream):
-                    # Prefetch the KV cache for the next layer
-                    self.layers[i].self_attn.transfer_manager.copy_event.wait()
-                    self.layers[prefetch_layer_id].self_attn.transfer_manager.is_transferring = True
-                    num_blocks = block_mapping[prefetch_layer_id][0].size()[0]
-                    for j in range(num_blocks):
-                        gpu_block_number = block_mapping[prefetch_layer_id][0][j][0]
-                        cpu_block_number = block_mapping[prefetch_layer_id][0][j][1]
-                        gpu_block_k = kv_caches[0][gpu_block_number]
-                        cpu_block_k = cpu_cache[0][cpu_block_number]
-                        cpu_block_k.copy_(gpu_block_k, non_blocking=True)
-                        gpu_block_v = kv_caches[1][gpu_block_number]
-                        cpu_block_v = cpu_cache[1][cpu_block_number]
-                        cpu_block_v.copy_(gpu_block_v, non_blocking=True)
-                # self.layers[prefetch_layer_id].self_attn.transfer_manager.prefetch(kv_caches, cpu_cache, block_mapping[prefetch_layer_id][0])
+                events = layer.self_attn.transfer_manager.events
+                self.layers[prefetch_layer_id].self_attn.transfer_manager.prefetch(
+                    cpu_cache=cpu_cache,
+                    gpu_cache=kv_caches,
+                    block_mapping=block_mapping[prefetch_layer_id][0],
+                    events=events,
+                )
             end_time = time.time()
             layer_time = end_time - start_time
             with open('/home/panenbao/vllm/logs/time_per_layer.log', 'a') as f:
