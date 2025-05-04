@@ -14,7 +14,7 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          ModelConfig, ObservabilityConfig, ParallelConfig,
                          PoolerConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig, TaskOption, TokenizerPoolConfig,
-                         VllmConfig)
+                         VllmConfig, LayerKVConfig)
 from vllm.executor.executor_base import ExecutorBase
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
@@ -115,9 +115,10 @@ class EngineArgs:
     enable_prefix_caching: Optional[bool] = None
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
-    swap_space: float = 4  # GiB
+    swap_space: float = 70  # GiB
     cpu_offload_gb: float = 0  # GiB
-    gpu_memory_utilization: float = 0.90
+    # gpu_memory_utilization: float = 0.90
+    gpu_memory_utilization: float = 0.70
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: Optional[int] = None
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
@@ -194,6 +195,20 @@ class EngineArgs:
     compilation_config: Optional[CompilationConfig] = None
     worker_cls: str = "auto"
 
+    # LayerKV settings    
+    enable_slo_scheduler: bool = True
+    slo_ttft: Optional[float] = 1000
+    slo_tpot: Optional[float] = 200
+    predictor_path: Optional[str] = "/mnt/HDD0/panenbao/models"
+    enable_layer_wise_cache: bool = True
+    # empirical correction factors
+    # alpha for estimate the prefill time for each request
+    estimate_prefill_alpha_factor: Optional[float] = 1089.321656324961
+    # beta for estimate the offloading time from GPU to CPU
+    estimate_offload_beta_factor: Optional[float] = 0.0000003531196332461630412455962785278629
+    device_flops: Optional[float] = 1.95e13
+    pcie_bandwidth: Optional[float] = 64.0
+    
     kv_transfer_config: Optional[KVTransferConfig] = None
 
     generation_config: Optional[str] = None
@@ -944,17 +959,64 @@ class EngineArgs:
             type=str,
             default="auto",
             help='The worker class to use for distributed execution.')
-
+        
+        # LayerKV arguments
+        # Scheduler
         parser.add_argument(
-            "--generation-config",
-            type=nullable_str,
-            default=None,
-            help="The folder path to the generation config. "
-            "Defaults to None, will use the default generation config in vLLM. "
-            "If set to 'auto', the generation config will be automatically "
-            "loaded from model. If set to a folder path, the generation config "
-            "will be loaded from the specified folder path.")
-
+            '--enable-slo-scheduler',
+            action='store_true',
+            default=True,
+            help='Enable SLO scheduler')
+        
+        parser.add_argument(
+            '--slo-ttft',
+            type=float,
+            default=3000.0,
+            help='TTFT SLO for SLO scheduler, ms.')
+        
+        parser.add_argument(
+            '--slo-tpot',
+            type=float,
+            default=200.0,
+            help='TPOT SLO for SLO scheduler, ms.')
+        
+        parser.add_argument(
+            '--estimate-prefill-alpha-factor',
+            type=float,
+            default=1089.321656324961,
+            help='alpha for estimate the prefill time for each request')
+        
+        parser.add_argument(
+            '--estimate-offload-beta-factor',
+            type=float,
+            default=1.0,
+            help='beta for estimate the offloading time from GPU to CPU')
+        
+        parser.add_argument(
+            '--predictor-path',
+            type=str,
+            default="/mnt/HDD0/panenbao/models",
+            help='Path od predictor for slo-aware scheduler.')
+        
+        # KV cache
+        parser.add_argument(
+            '--enable-layer-wise-cache',
+            action='store_true',
+            default=True,
+            help='Enable layer-wise cache management. ')
+        
+        parser.add_argument(
+            '--device-flops',
+            type=float,
+            default=1.95e13,
+            help='The flops for the device.')
+        
+        parser.add_argument(
+            '--pcie-bandwidth',
+            type=float,
+            default=64.0,
+            help='The bandwidth of the PCIe. GB/s')
+        
         return parser
 
     @classmethod
@@ -1059,6 +1121,7 @@ class EngineArgs:
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
+            enable_layer_wise_cache=self.enable_layer_wise_cache,
         )
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
@@ -1196,7 +1259,20 @@ class EngineArgs:
             multi_step_stream_outputs=self.multi_step_stream_outputs,
             send_delta_data=(envs.VLLM_USE_RAY_SPMD_WORKER
                              and parallel_config.use_ray),
-            policy=self.scheduling_policy)
+            policy=self.scheduling_policy,
+            enable_slo_scheduler=self.enable_slo_scheduler,
+            slo_ttft=self.slo_ttft,
+            slo_tpot=self.slo_tpot,
+            # estimate_prefill_alpha_factor = self.estimate_prefill_alpha_factor,
+            # estimate_offload_beta_factor = self.estimate_offload_beta_factor,
+            predictor_path=self.predictor_path,)
+        layer_kv_config = LayerKVConfig(
+            enable_layer_wise_cache=self.enable_layer_wise_cache,
+            pcie_bandwidth=self.pcie_bandwidth,
+            device_flops=self.device_flops,
+            prefill_alpha=self.estimate_prefill_alpha_factor,
+            offload_beta=self.estimate_offload_beta_factor,
+        )
         lora_config = LoRAConfig(
             bias_enabled=self.enable_lora_bias,
             max_lora_rank=self.max_lora_rank,
@@ -1255,6 +1331,7 @@ class EngineArgs:
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
+            layer_kv_config=layer_kv_config,
         )
 
         if envs.VLLM_USE_V1:

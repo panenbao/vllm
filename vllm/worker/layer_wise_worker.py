@@ -1,11 +1,13 @@
 """A GPU worker class."""
 import gc
 import os
+import time
 from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import torch
 import torch.distributed
 
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (ensure_kv_transfer_initialized,
@@ -22,9 +24,11 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sequence import (ExecuteModelRequest, IntermediateTensors,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta)
 from vllm.utils import GiB_bytes, memory_profiling
-from vllm.worker.cache_engine import CacheEngine, LayerWiseCacheEngine
+from vllm.worker.cache_engine import CacheEngine
+from vllm.worker.layer_wise_cache_engine import LayerWiseCacheEngine
 from vllm.worker.enc_dec_model_runner import EncoderDecoderModelRunner
 from vllm.worker.model_runner import GPUModelRunnerBase, ModelRunner
+from vllm.worker.layer_wise_model_runner import LayerWiseModelRunner
 from vllm.worker.pooling_model_runner import PoolingModelRunner
 from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
                                      WorkerInput)
@@ -32,7 +36,7 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
 logger = init_logger(__name__)
 
 
-class Worker(LocalOrDistributedWorkerBase):
+class LayerWiseWorker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a GPU.
 
     Each worker is associated with a single GPU. The worker is responsible for
@@ -79,7 +83,13 @@ class Worker(LocalOrDistributedWorkerBase):
             ModelRunnerClass = PoolingModelRunner
         elif self.model_config.is_encoder_decoder:
             ModelRunnerClass = EncoderDecoderModelRunner
-        self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
+        # self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
+        #     vllm_config=self.vllm_config,
+        #     kv_cache_dtype=self.cache_config.cache_dtype,
+        #     is_driver_worker=is_driver_worker,
+        #     **speculative_args,
+        # )
+        self.model_runner: GPUModelRunnerBase = LayerWiseModelRunner(
             vllm_config=self.vllm_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
@@ -202,7 +212,8 @@ class Worker(LocalOrDistributedWorkerBase):
                               self.init_gpu_memory,
                               weights_memory_in_bytes=self.model_runner.
                               model_memory_usage) as result:
-            self.model_runner.profile_run()
+            # TODO: Uncomment the following line to profile the model.
+            # self.model_runner.profile_run()
             torch.cuda.synchronize()
 
         self._assert_memory_footprint_increased_during_profiling()
@@ -224,6 +235,9 @@ class Worker(LocalOrDistributedWorkerBase):
                                  cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
+        print(f"block_size {self.cache_config.block_size}")
+        num_gpu_blocks -= num_gpu_blocks % 16
+        num_cpu_blocks -= num_cpu_blocks % 16
 
         msg = (f"Memory profiling takes {result.profile_time:.2f} seconds\n"
                "the current vLLM instance can use "
@@ -275,7 +289,8 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         self._init_cache_engine()
-        self._warm_up_model()
+        # TODO: Uncomment the following line to warm up the model.
+        # self._warm_up_model()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
@@ -292,8 +307,6 @@ class Worker(LocalOrDistributedWorkerBase):
             self.cache_engine[ve].gpu_cache
             for ve in range(self.parallel_config.pipeline_parallel_size)
         ]
-        bind_kv_cache(self.compilation_config.static_forward_context,
-                      self.gpu_cache)
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
@@ -449,10 +462,73 @@ class Worker(LocalOrDistributedWorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(self.cache_config,
+        return LayerWiseCacheEngine.get_cache_block_size(self.cache_config,
                                                 self.model_config,
                                                 self.parallel_config)
+    def execute_model(
+        self,
+        execute_model_req: Optional[ExecuteModelRequest] = None,
+        block_mapping: Optional[Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]] = None,
+    ) -> Optional[List[SamplerOutput]]:
+        """Executes at least one model step on the given sequences, unless no
+        sequences are provided."""
+        start_time = time.perf_counter()
 
+        inputs = self.prepare_input(execute_model_req)
+        if inputs is None:
+            return None
+
+        model_input, worker_input, kwargs = inputs
+        num_steps = worker_input.num_steps
+
+        self.execute_worker(worker_input)
+
+        # If there is no input, we don't need to execute the model.
+        if worker_input.num_seq_groups == 0:
+            return []
+
+        intermediate_tensors = None
+        orig_model_execute_time = 0.0
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                orig_model_execute_time = intermediate_tensors.tensors.get(
+                    "model_execute_time", torch.tensor(0)).item()
+
+        output = self.model_runner.execute_model(
+            model_input=model_input,
+            kv_caches=self.kv_cache[worker_input.virtual_engine]
+            if self.kv_cache is not None else None,
+            cpu_cache=self.cache_engine[worker_input.virtual_engine].cpu_cache
+            if self.cache_engine is not None else None,
+            block_mapping=block_mapping,
+            intermediate_tensors=intermediate_tensors,
+            num_steps=num_steps,
+            **kwargs,
+        )
+
+        model_execute_time = time.perf_counter() - start_time
+        if not get_pp_group().is_last_rank:
+            # output is IntermediateTensors
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_execute_time):
+                output.tensors["model_execute_time"] = torch.tensor(
+                    model_execute_time + orig_model_execute_time)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return [None]
+        if (self.observability_config is not None
+                and self.observability_config.collect_model_execute_time
+                and output is not None):
+            for o in output:
+                o.model_execute_time = (orig_model_execute_time +
+                                        model_execute_time)
+
+        # output is List[SamplerOutput]
+        return output
 
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,

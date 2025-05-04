@@ -24,6 +24,7 @@ from vllm.multimodal import MultiModalDataDict
 from vllm.sampling_params import BeamSearchParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer, get_lora_tokenizer
 from vllm.utils import FlexibleArgumentParser, merge_async_iterators
+from vllm.prediction_utils.predictor import BertClassificationModel, BertRegressionModel
 
 
 @dataclasses.dataclass

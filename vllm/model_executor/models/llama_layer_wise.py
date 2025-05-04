@@ -20,7 +20,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
 
 import torch
@@ -57,7 +56,6 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-from vllm.model_executor.cuda_utils import KVCacheTransferManager
 
 
 class LlamaMLP(nn.Module):
@@ -195,29 +193,17 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.transfer_manager = KVCacheTransferManager()
-        self.layer_idx = layer_idx
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        cpu_cache: torch.Tensor,
-        block_mapping: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        is_transfer_layer = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        # torch.cuda.synchronize()
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        if is_transfer_layer and self.layer_idx % 2 == 0:
-            # Transfer the KV cache to the CPU
-            self.transfer_manager.offload(gpu_cache=kv_cache,
-                                          cpu_cache=cpu_cache,
-                                          block_mapping=block_mapping)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -277,11 +263,8 @@ class LlamaDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        cpu_cache: torch.Tensor,
-        block_mapping: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        is_transfer_layer: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
@@ -293,10 +276,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
-                                       cpu_cache=cpu_cache,
-                                       block_mapping=block_mapping,
-                                       attn_metadata=attn_metadata,
-                                       is_transfer_layer=is_transfer_layer)
+                                       attn_metadata=attn_metadata)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -361,8 +341,6 @@ class LlamaModel(nn.Module):
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         kv_caches: torch.Tensor,
-        cpu_cache: torch.Tensor,
-        block_mapping: Dict[int, Tuple[torch.tensor, torch.tensor]],
         attn_metadata: List[AttentionMetadata],
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
@@ -379,29 +357,10 @@ class LlamaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         for i in range(self.start_layer, self.end_layer):
-            start_time = time.time()
             layer = self.layers[i]
-            is_transfer_layer = i % 2 == 0
             hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches, cpu_cache,
-                                            block_mapping=block_mapping[i][1]
-                                            if is_transfer_layer else None,
-                                            attn_metadata=attn_metadata[i],
-                                            residual=residual,
-                                            is_transfer_layer=is_transfer_layer)
-            if i % 2 == 0:
-                prefetch_layer_id = (i + 2) % self.end_layer
-                events = layer.self_attn.transfer_manager.events
-                self.layers[prefetch_layer_id].self_attn.transfer_manager.prefetch(
-                    cpu_cache=cpu_cache,
-                    gpu_cache=kv_caches,
-                    block_mapping=block_mapping[prefetch_layer_id][0],
-                    events=events,
-                )
-            end_time = time.time()
-            layer_time = end_time - start_time
-            with open('/home/panenbao/vllm/logs/time_per_layer.log', 'a') as f:
-                f.write(f"layer: {i}, time: {layer_time}\n")
+                                            kv_caches,
+                                            attn_metadata[i], residual,)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -494,9 +453,8 @@ class LlamaModel(nn.Module):
                 # which is consistent with the practice of setting
                 # scaling_factor = tensor_amax / FPtype_max
                 scaling_factor *= 2
-            if hasattr(layer_self_attn.attn, "_k_scale"):
-                layer_self_attn.attn._k_scale = scaling_factor
-                layer_self_attn.attn._v_scale = scaling_factor
+            if hasattr(layer_self_attn, "kv_scale"):
+                layer_self_attn.attn._kv_scale = scaling_factor
             else:
                 raise RuntimeError("Self attention has no KV cache scaling "
                                    "factor attribute!")
@@ -604,14 +562,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_caches: torch.Tensor,
-        cpu_cache: torch.Tensor,
-        block_mapping: Dict[int, Tuple[torch.tensor, torch.tensor]],
-        attn_metadata:List[AttentionMetadata],
+        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(input_ids, positions, kv_caches,
-                                  cpu_cache, block_mapping,
                                   attn_metadata, intermediate_tensors,
                                   inputs_embeds)
         return model_output

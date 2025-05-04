@@ -20,7 +20,7 @@ def create_worker(**kwargs):
     return wrapper.worker
 
 
-class GPUExecutor(ExecutorBase):
+class LayerWiseGPUExecutor(ExecutorBase):
 
     uses_ray: bool = False
 
@@ -88,9 +88,9 @@ class GPUExecutor(ExecutorBase):
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
     def execute_model(
-        self, execute_model_req: ExecuteModelRequest
+        self, execute_model_req: ExecuteModelRequest, block_mapping: Dict[int, Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]]
     ) -> Optional[List[Union[SamplerOutput, PoolerOutput]]]:
-        output = self.driver_worker.execute_model(execute_model_req)
+        output = self.driver_worker.execute_model(execute_model_req, block_mapping)
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -139,7 +139,7 @@ class GPUExecutor(ExecutorBase):
         self.driver_worker.stop_profile()
 
 
-class GPUExecutorAsync(GPUExecutor, ExecutorAsyncBase):
+class LayerWiseGPUExecutorAsync(LayerWiseGPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
         self,

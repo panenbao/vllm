@@ -273,9 +273,11 @@ def unified_attention_with_output(
     layer_name: str,
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    self = forward_context.attn_layers[layer_name]
-    kv_cache = self.kv_cache[forward_context.virtual_engine]
+    attn_metadata = forward_context.dynamic_forward_context
+    if isinstance(attn_metadata, List):
+        layer_id = layer_name.split(".")[2]
+        attn_metadata = attn_metadata[int(layer_id)]
+    self = forward_context.static_forward_context[layer_name]
     self.impl.forward(query,
                       key,
                       value,

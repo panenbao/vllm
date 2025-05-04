@@ -77,6 +77,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.prediction_utils.predictor import BertClassificationModel
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 

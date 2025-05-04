@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm.worker.layer_wise_model_runner import (
         LayerWiseModelInputForGPUBuilder,
         LayerWiseModelInputForGPUWithSamplingMetadata)
+
 from vllm.vllm_flash_attn import (flash_attn_varlen_func,
                                   flash_attn_with_kvcache)
 
@@ -373,11 +374,12 @@ class FlashAttentionMetadata(AttentionMetadata):
 class FlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[FlashAttentionMetadata]):
 
-    def __init__(self, input_builder: "ModelInputForGPUBuilder"):
+    def __init__(self, input_builder: "LayerWiseModelInputForGPUBuilder"):
         self.slot_mapping: List[int] = []
         self.prefill_seq_lens: List[int] = []
         self.context_lens: List[int] = []
         self.block_tables: List[List[int]] = []
+        self.layer_block_tables: List[Dict[int, List[int]]] = []
         self.curr_seq_lens: List[int] = []
         self.multimodal_placeholder_maps: Dict[
             str,
@@ -391,9 +393,10 @@ class FlashAttentionMetadataBuilder(
         self.runner = input_builder.runner
         self.sliding_window = input_builder.sliding_window
         self.block_size = input_builder.block_size
+        self.num_layers = input_builder.num_layers
 
     def _add_seq_group(
-            self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
+            self, inter_data: "LayerWiseModelInputForGPUBuilder.InterDataForSeqGroup",
             chunked_prefill_enabled: bool, prefix_cache_hit: bool):
         """Add a sequence group to the metadata. Specifically update/append
         1. context length.
@@ -402,6 +405,7 @@ class FlashAttentionMetadataBuilder(
         """
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
+        layer_block_tables = inter_data.layer_block_tables
 
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block) in zip(
@@ -430,18 +434,24 @@ class FlashAttentionMetadataBuilder(
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
+            layer_block_table = []
             if prefix_cache_hit:
                 # NOTE(woosuk): For flash-attn, the block table should
                 # include the entries for the incoming prefill tokens.
                 block_table = block_tables[seq_id]
+                layer_block_table = layer_block_tables[seq_id]
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 if curr_sliding_window_block == 0:
                     block_table = block_tables[seq_id]
+                    layer_block_table = layer_block_tables[seq_id]
                 else:
                     block_table = block_tables[seq_id][
                         -curr_sliding_window_block:]
+                    layer_block_table = layer_block_tables[seq_id][
+                        -curr_sliding_window_block:]
             self.block_tables.append(block_table)
+            self.layer_block_tables.append(layer_block_table)
 
             # Compute slot mapping.
             is_profile_run = is_block_tables_empty(block_tables)
@@ -477,8 +487,7 @@ class FlashAttentionMetadataBuilder(
             device=self.runner.device, non_blocking=True)
 
     def build(self, seq_lens: List[int], query_lens: List[int],
-              cuda_graph_pad_size: int, batch_size: int,
-              inter_data_list: Optional[List["LayerWiseModelInputForGPUBuilder.InterDataForSeqGroup"]] = None):
+              cuda_graph_pad_size: int, batch_size: int):
         """Build attention metadata with on-device tensors.
 
         Args:
@@ -488,13 +497,11 @@ class FlashAttentionMetadataBuilder(
                                  -1 if cuda graph is not used.
             batch_size: The maybe padded batch size.
         """
-        if inter_data_list is None:
-            inter_data_list = self.input_builder.inter_data_list
         prefix_cache_hit = any([
             inter_data.prefix_cache_hit
-            for inter_data in inter_data_list
+            for inter_data in self.input_builder.inter_data_list
         ])
-        for inter_data in inter_data_list:
+        for inter_data in self.input_builder.inter_data_list:
             self._add_seq_group(inter_data,
                                 self.input_builder.chunked_prefill_enabled,
                                 prefix_cache_hit)
@@ -605,7 +612,6 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -633,7 +639,6 @@ class FlashAttentionImpl(AttentionImpl):
             raise ValueError(
                 f"Head size {head_size} is not supported by FlashAttention. "
                 f"Supported head sizes are: {support_head_sizes}.")
-        self.attn_type = attn_type
 
     def forward(
         self,
@@ -644,6 +649,7 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        attn_type: str = AttentionType.DECODER,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -665,7 +671,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         assert output is not None, "Output tensor must be provided."
 
-        attn_type = self.attn_type
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
             raise AttributeError("Encoder attention requires setting "

@@ -43,9 +43,7 @@ class WorkerBase(ABC):
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
-        self.compilation_config = vllm_config.compilation_config
-        from vllm.platforms import current_platform
-        self.current_platform = current_platform
+        self.layer_kv_config = vllm_config.layer_kv_config
 
     @abstractmethod
     def init_device(self) -> None:
@@ -447,6 +445,7 @@ class WorkerWrapperBase:
         # see https://github.com/NVIDIA/nccl/issues/1234
         os.environ['NCCL_CUMEM_ENABLE'] = '0'
 
+        # TODO: 实现通过插件加载layer wise功能
         from vllm.plugins import load_general_plugins
         load_general_plugins()
 
